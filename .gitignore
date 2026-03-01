@@ -1,0 +1,12 @@
+*/runs/
+*/venv/
+*.pt
+
+#classification 下
+classification_model_train/
+!classification_model_train/train_mahjong_classifier.py
+
+#mahjong_agent下
+mahjong_agent/__pycache__/
+mahjong_agent/Image
+mahjong_agent/models
