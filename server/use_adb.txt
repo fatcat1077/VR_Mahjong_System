@@ -1,0 +1,49 @@
+# Quest ↔ PC (USB) TCP 5000 常用指令小抄
+
+## 0) 進到 platform-tools
+cd C:\Android\platform-tools
+
+## 1) 確認 adb 是否正常、裝置是否連上
+adb version
+adb devices
+# 看到像這樣就 OK：
+# xxxxxxxxxxxx  device
+
+## 2) 建立 USB 反向轉發（Quest:5000 → PC:5000）
+adb reverse tcp:5000 tcp:5000
+adb reverse --list
+# 清單裡要看到：tcp:5000 tcp:5000
+# 若沒有 5000，就再跑一次 adb reverse tcp:5000 tcp:5000
+
+## 3) 檢查 PC 端 5000 有沒有在聽（server 有沒有起來）
+netstat -ano | findstr :5000
+# 要看到 LISTENING，例如：
+# 0.0.0.0:5000 ... LISTENING PID
+
+## 4) 找出是哪個程式佔用該 PID、必要時強制關掉
+tasklist | findstr <PID>
+taskkill /PID <PID> /F
+# <PID> 請換成 netstat 查到的 PID
+
+## 5) 重新確認（我到底有沒有準備好）
+adb devices
+adb reverse --list
+netstat -ano | findstr :5000
+
+
+python server.py `
+  --yolo "C:\Users\user\Desktop\VR_project\screen_shot\yolo.pt" `
+  --cls "C:\Users\user\Desktop\VR_project\screen_shot\best_classify.pt" `
+  --host 0.0.0.0 --port 5000 `
+  --ppo-model tw_mahjong_ppo_gpu.zip `
+  --ppo-device cuda `
+  --print-interval 10
+
+  python server_dump.py `
+  --yolo C:\Users\user\Desktop\VR_project\screen_shot\yolo.pt `
+  --cls  C:\Users\user\Desktop\VR_project\screen_shot\best_classify.pt `
+  --host 0.0.0.0 --port 5000 `
+  --print-interval 1 `
+  --dump-dir dumps `
+  --dump-every 10 `
+  --dump-on-empty

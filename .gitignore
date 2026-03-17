@@ -10,3 +10,15 @@ classification_model_train/
 mahjong_agent/__pycache__/
 mahjong_agent/Image
 mahjong_agent/models
+
+#server下
+server/photoes
+server/server_A/dumps
+
+#Unity下
+Unity/*
+!Unity/Assets/
+Unity/Assets/*
+!Unity/Assets/PassthroughCameraApiSamples/
+Unity/Assets/PassthroughCameraApiSamples/*
+!Unity/Assets/PassthroughCameraApiSamples/MultiObjectDetection/
