@@ -1,5 +1,6 @@
 import re
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -31,6 +32,13 @@ _CANONICAL_ID_TO_LABEL = (
     + ["E", "S", "W", "N", "P", "F", "C"]
 )
 
+PHASE_DISCARD = 0
+PHASE_CLAIM = 1
+TURN_STABLE_FRAMES = 5
+TURN_CORRECTION_COOLDOWN_FRAMES = 15
+OBS_DIM = 175
+ACTION_DIM = 39
+
 _ZH_NUM = {
     "一": 1,
     "二": 2,
@@ -52,6 +60,10 @@ _HONOR_MAP = {
     "F": 32,
     "C": 33,
     # common alternates
+    "EAST": 27,
+    "SOUTH": 28,
+    "WEST": 29,
+    "NORTH": 30,
     "WHITE": 31,
     "WH": 31,
     "WD": 31,
@@ -173,6 +185,60 @@ def obs34_from_hand_labels(hand_labels: List[str]) -> np.ndarray:
     return cnt
 
 
+def tile_labels_to_ids(labels: Sequence[str]) -> List[int]:
+    """Convert classifier labels to legal 0..33 tile ids."""
+    tile_ids: List[int] = []
+    for label in labels:
+        tile_id = tile_label_to_id(label)
+        if tile_id is not None and 0 <= tile_id < 34:
+            tile_ids.append(int(tile_id))
+    return tile_ids
+
+
+def sort_tile_ids(tiles: Sequence[int]) -> List[int]:
+    """Sort tile ids by suit and rank using the fixed 0..33 action/order mapping."""
+    valid_tiles: List[int] = []
+    for tile in tiles:
+        tile_id = int(tile)
+        if 0 <= tile_id < 34:
+            valid_tiles.append(tile_id)
+    return sorted(valid_tiles)
+
+
+def sorted_tile_labels_from_ids(tiles: Sequence[int]) -> List[str]:
+    """Return display labels sorted as m, p, s, honors."""
+    return [tile_id_to_label(tile_id) for tile_id in sort_tile_ids(tiles)]
+
+
+def sort_tile_labels(labels: Sequence[str]) -> List[str]:
+    """Sort classifier labels by Mahjong suit/rank; unknown labels keep their relative order at the end."""
+    sortable = []
+    unknown = []
+    for idx, label in enumerate(labels):
+        tile_id = tile_label_to_id(label)
+        if tile_id is None:
+            unknown.append((idx, str(label)))
+        else:
+            sortable.append((int(tile_id), idx, str(label)))
+    sortable.sort(key=lambda item: (item[0], item[1]))
+    return [label for _, _, label in sortable] + [label for _, label in unknown]
+
+
+def is_self_discard_turn_by_hand_count(hand_tiles: Sequence[int]) -> bool:
+    """Player0 has just drawn when hand count is 3n+2."""
+    return len(hand_tiles) > 0 and len(hand_tiles) % 3 == 2
+
+
+def count34_from_tiles(tiles: Sequence[int]) -> np.ndarray:
+    """Build a 34-dim tile count vector from 0..33 tile ids."""
+    cnt = np.zeros((34,), dtype=np.float32)
+    for tile in tiles:
+        tile_id = int(tile)
+        if 0 <= tile_id < 34:
+            cnt[tile_id] += 1.0
+    return cnt
+
+
 def heuristic_safe_discard_id(cnt: np.ndarray) -> Optional[int]:
     """"Most safe" heuristic without table context.
 
@@ -229,6 +295,203 @@ def heuristic_benefit_fallback_id(cnt: np.ndarray) -> Optional[int]:
     Currently identical to safe heuristic.
     """
     return heuristic_safe_discard_id(cnt)
+
+
+def fallback_discard_tile(detected_hand_tiles: Sequence[int]) -> Optional[int]:
+    """Return a legal discard tile from the detected hand."""
+    if not detected_hand_tiles:
+        return None
+
+    cnt = count34_from_tiles(detected_hand_tiles)
+    tile_id = heuristic_safe_discard_id(cnt)
+    if tile_id is not None and int(cnt[int(tile_id)]) > 0:
+        return int(tile_id)
+
+    for tile in detected_hand_tiles:
+        tile_id = int(tile)
+        if 0 <= tile_id < 34:
+            return tile_id
+    return None
+
+
+class GameStateTracker:
+    """Minimal state needed to build the PPO observation from live vision."""
+
+    def __init__(
+        self,
+        stable_frames: int = TURN_STABLE_FRAMES,
+        cooldown_frames: int = TURN_CORRECTION_COOLDOWN_FRAMES,
+    ):
+        self.current_player = 0
+        self.phase = PHASE_DISCARD
+        self.discards: List[List[int]] = [[], [], [], []]
+        self.last_discard: Optional[int] = None
+        self.last_discarder: Optional[int] = None
+        self.open_chi_count = 0
+        self.open_pon_count = 0
+        self.frame_index = 0
+        self.cooldown_frames_remaining = 0
+        self._recent_hand_counts = deque(maxlen=max(1, int(stable_frames)))
+        self._stable_frames = max(1, int(stable_frames))
+        self._cooldown_frames = max(0, int(cooldown_frames))
+
+    def reset_runtime(self) -> None:
+        self.frame_index = 0
+        self.cooldown_frames_remaining = 0
+        self._recent_hand_counts.clear()
+
+    def update_hand_count_stability(self, detected_hand_tiles: Sequence[int]) -> bool:
+        self.frame_index += 1
+        if self.cooldown_frames_remaining > 0:
+            self.cooldown_frames_remaining -= 1
+
+        self._recent_hand_counts.append(len(detected_hand_tiles))
+        if len(self._recent_hand_counts) < self._stable_frames:
+            return False
+        return len(set(self._recent_hand_counts)) == 1
+
+    def can_correct_this_frame(self) -> bool:
+        return self.cooldown_frames_remaining <= 0
+
+    def correct_to_self_discard(self) -> None:
+        self.current_player = 0
+        self.phase = PHASE_DISCARD
+        self.cooldown_frames_remaining = self._cooldown_frames
+
+
+def build_obs_from_tracker(tracker: GameStateTracker, detected_hand_tiles: Sequence[int]) -> np.ndarray:
+    """Build the unchanged 175-dim PPO observation layout."""
+    obs = np.zeros((OBS_DIM,), dtype=np.float32)
+
+    obs[0:34] = count34_from_tiles(detected_hand_tiles)
+
+    offset = 34
+    for player in range(4):
+        obs[offset : offset + 34] = count34_from_tiles(tracker.discards[player])
+        offset += 34
+
+    obs[170] = 0.0 if tracker.last_discard is None else (float(tracker.last_discard) + 1.0) / 34.0
+    obs[171] = 0.0 if tracker.last_discarder is None else (float(tracker.last_discarder) + 1.0) / 4.0
+    obs[172] = float(tracker.phase)
+    obs[173] = float(tracker.open_chi_count) / 5.0
+    obs[174] = float(tracker.open_pon_count) / 5.0
+
+    return obs
+
+
+def _topk_ppo_action_probs(rl_model, obs: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
+    if rl_model is None or torch is None or top_k <= 0:
+        return []
+    try:
+        device = getattr(rl_model, "device", "cpu")
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        dist = rl_model.policy.get_distribution(obs_t)
+        probs = dist.distribution.probs.squeeze(0).detach().cpu().numpy()
+        idx = np.argsort(-probs)[:top_k]
+        return [
+            {
+                "action": int(action),
+                "prob": float(probs[action]),
+                "tile": tile_id_to_label(int(action)) if 0 <= int(action) < 34 else action_to_label(int(action)),
+            }
+            for action in idx
+        ]
+    except Exception as e:
+        return [{"action": -1, "prob": 0.0, "tile": "", "error": str(e)}]
+
+
+def action_to_label(action: int) -> str:
+    if 0 <= action <= 33:
+        return tile_id_to_label(action)
+    if action == 34:
+        return "PASS"
+    if action == 35:
+        return "PON"
+    if action == 36:
+        return "CHI_LOW"
+    if action == 37:
+        return "CHI_MID"
+    if action == 38:
+        return "CHI_HIGH"
+    return str(action)
+
+
+def _empty_live_agent_result(detected_hand_tiles: Sequence[int], reason: str) -> Dict[str, Any]:
+    return {
+        "corrected": False,
+        "stable_count_frames": 0,
+        "hand_count": len(detected_hand_tiles),
+        "recommended_action": -1,
+        "recommended_tile": "",
+        "source": "none",
+        "reason": reason,
+        "topk": [],
+    }
+
+
+def maybe_correct_self_turn_and_suggest(
+    tracker: GameStateTracker,
+    detected_hand_tiles: Sequence[int],
+    rl_model=None,
+    top_k: int = 5,
+) -> Dict[str, Any]:
+    """Correct Player0 discard phase from stable hand count and produce a legal discard."""
+    hand_tiles = [int(t) for t in detected_hand_tiles if 0 <= int(t) < 34]
+    stable = tracker.update_hand_count_stability(hand_tiles)
+
+    if not stable:
+        result = _empty_live_agent_result(hand_tiles, "hand count is not stable yet")
+        result["stable_count_frames"] = len(tracker._recent_hand_counts)
+        return result
+
+    if not is_self_discard_turn_by_hand_count(hand_tiles):
+        result = _empty_live_agent_result(hand_tiles, "stable hand count is not 3n+2")
+        result["stable_count_frames"] = len(tracker._recent_hand_counts)
+        return result
+
+    corrected = False
+    if tracker.can_correct_this_frame():
+        tracker.correct_to_self_discard()
+        corrected = True
+
+    obs = build_obs_from_tracker(tracker, hand_tiles)
+    source = "ppo"
+    reason = "PPO policy (deterministic) after Player0 discard-turn correction"
+    action_id: Optional[int] = None
+
+    if rl_model is not None:
+        try:
+            action, _ = rl_model.predict(obs, deterministic=True)
+            action_id = int(action)
+        except Exception as e:
+            source = "fallback"
+            reason = f"PPO predict failed; fallback discard ({e})"
+            action_id = fallback_discard_tile(hand_tiles)
+    else:
+        source = "fallback"
+        reason = "PPO model not loaded; fallback discard"
+        action_id = fallback_discard_tile(hand_tiles)
+
+    if action_id is None or not (0 <= action_id <= 33) or action_id not in hand_tiles:
+        source = "fallback" if source == "ppo" else source
+        reason = "PPO action illegal for detected hand; fallback discard"
+        action_id = fallback_discard_tile(hand_tiles)
+
+    tile = tile_id_to_label(action_id) if action_id is not None else ""
+
+    return {
+        "corrected": corrected,
+        "current_player": tracker.current_player,
+        "phase": tracker.phase,
+        "stable_count_frames": len(tracker._recent_hand_counts),
+        "cooldown_frames_remaining": tracker.cooldown_frames_remaining,
+        "hand_count": len(hand_tiles),
+        "recommended_action": int(action_id) if action_id is not None else -1,
+        "recommended_tile": tile,
+        "source": source,
+        "reason": reason,
+        "topk": _topk_ppo_action_probs(rl_model, obs, top_k=top_k),
+    }
 
 
 def load_ppo_model(ppo_model_path: Optional[str], ppo_device: Optional[str] = None):

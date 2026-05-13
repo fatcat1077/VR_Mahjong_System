@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -15,6 +18,12 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 Box = Tuple[int, int, int, int]
+
+
+def _safe_name(value: object) -> str:
+    text = str(value if value is not None else "unknown")
+    text = re.sub(r"[^0-9A-Za-z_.-]+", "_", text).strip("_")
+    return text or "unknown"
 
 
 def decode_jpg(jpg: bytes) -> np.ndarray:
@@ -92,7 +101,7 @@ class TorchMBV3SmallClassifier:
         self,
         weights_path: str,
         device: torch.device,
-        img_size: int = 224,
+        img_size: int = 96,
         labels: Optional[List[str]] = None,
         mean=IMAGENET_MEAN,
         std=IMAGENET_STD,
@@ -165,6 +174,8 @@ class VisionPipeline:
         device: Optional[str] = None,
         cls_labels_path: Optional[str] = None,
         cls_nc: Optional[int] = None,
+        debug_dir: Optional[str] = None,
+        debug_interval_sec: float = 1.0,
     ):
         self.det_imgsz = int(det_imgsz)
         self.det_conf = float(det_conf)
@@ -172,6 +183,9 @@ class VisionPipeline:
         self.cls_imgsz = int(cls_imgsz)
         self.crop_pad = float(crop_pad)
         self.device = device  # for ultralytics.predict
+        self.debug_dir = Path(debug_dir) if debug_dir else None
+        self.debug_interval_sec = max(0.1, float(debug_interval_sec))
+        self._last_debug_dump_time = 0.0
 
         # torch device for fallback classifier
         if device is None:
@@ -215,6 +229,10 @@ class VisionPipeline:
 
         self._warned_no_probs = False
 
+        if self.debug_dir is not None:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[DBG] Vision dump enabled: {self.debug_dir} every {self.debug_interval_sec:.1f}s")
+
     def expand_box(self, box, w: int, h: int) -> Optional[Box]:
         x1, y1, x2, y2 = box
         bw = x2 - x1
@@ -234,6 +252,25 @@ class VisionPipeline:
         if getattr(det_res, "boxes", None) is None or len(det_res.boxes) == 0:
             return np.empty((0, 4), dtype=np.float32)
         return det_res.boxes.xyxy.cpu().numpy()
+
+    def _extract_detection_classes(self, det_res) -> np.ndarray:
+        """Return detection class ids, or -1 when classes are unavailable."""
+        if getattr(det_res, "boxes", None) is None or len(det_res.boxes) == 0:
+            return np.empty((0,), dtype=np.int32)
+        cls = getattr(det_res.boxes, "cls", None)
+        if cls is None:
+            return np.full((len(det_res.boxes),), -1, dtype=np.int32)
+        return cls.cpu().numpy().astype(np.int32)
+
+    def _area_type_for_class(self, class_id: int) -> Optional[str]:
+        if class_id < 0:
+            return None
+        name = str(getattr(self.det_model, "names", {}).get(int(class_id), "")).lower()
+        if "hand" in name:
+            return "hand"
+        if "table" in name:
+            return "table"
+        return None
 
     def _extract_masks(self, det_res) -> Optional[np.ndarray]:
         """Return segmentation masks as uint8 array (N,H,W) or None."""
@@ -284,7 +321,13 @@ class VisionPipeline:
         crop[mask_crop == 0] = 0
         return crop
 
+    def _prepare_classification_input(self, crop_bgr: np.ndarray) -> np.ndarray:
+        if crop_bgr is None or crop_bgr.size == 0:
+            return crop_bgr
+        return cv2.resize(crop_bgr, (self.cls_imgsz, self.cls_imgsz), interpolation=cv2.INTER_LINEAR)
+
     def classify_crop(self, crop_bgr: np.ndarray):
+        crop_bgr = self._prepare_classification_input(crop_bgr)
         if self.cls_backend == "ultralytics":
             cls_res = self.cls_model.predict(
                 crop_bgr,
@@ -306,13 +349,73 @@ class VisionPipeline:
         cname, cconf, _ = self.torch_cls.predict_bgr(crop_bgr)
         return cname, cconf
 
+    def _open_debug_dump(self, frame_bgr: np.ndarray):
+        if self.debug_dir is None:
+            return None, None
+        now = time.time()
+        if now - self._last_debug_dump_time < self.debug_interval_sec:
+            return None, None
+
+        self._last_debug_dump_time = now
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+        millis = int((now - int(now)) * 1000)
+        dump_dir = self.debug_dir / f"{stamp}_{millis:03d}"
+        crops_dir = dump_dir / "crops"
+        inputs_dir = dump_dir / "classify_input_96"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+
+        cv2.imwrite(str(dump_dir / "original.jpg"), frame_bgr)
+        meta = [
+            f"time={stamp}_{millis:03d}",
+            f"frame_shape={frame_bgr.shape}",
+            f"det_imgsz={self.det_imgsz}",
+            f"det_conf={self.det_conf}",
+            f"det_iou={self.det_iou}",
+            f"crop_pad={self.crop_pad}",
+            f"cls_backend={self.cls_backend}",
+            f"cls_imgsz={self.cls_imgsz}",
+        ]
+        return dump_dir, meta
+
+    def _save_debug_crop(
+        self,
+        dump_dir: Optional[Path],
+        meta: Optional[List[str]],
+        index: int,
+        area_type: Optional[str],
+        label: str,
+        conf: float,
+        box: Box,
+        crop_bgr: np.ndarray,
+    ) -> None:
+        if dump_dir is None or meta is None or crop_bgr is None or crop_bgr.size == 0:
+            return
+        area = _safe_name(area_type or "unknown_area")
+        name = _safe_name(label)
+        base = f"{index:02d}_{area}_{name}_{conf:.2f}"
+        crop_path = dump_dir / "crops" / f"{base}_crop.png"
+        input_path = dump_dir / "classify_input_96" / f"{base}_input.png"
+        cv2.imwrite(str(crop_path), crop_bgr)
+        cv2.imwrite(str(input_path), self._prepare_classification_input(crop_bgr))
+        meta.append(
+            f"{index:02d}: area={area_type or 'unknown'} label={label} conf={conf:.4f} "
+            f"box={tuple(int(v) for v in box)} crop={crop_path.name} input={input_path.name}"
+        )
+
+    def _finish_debug_dump(self, dump_dir: Optional[Path], meta: Optional[List[str]]) -> None:
+        if dump_dir is None or meta is None:
+            return
+        (dump_dir / "meta.txt").write_text("\n".join(meta) + "\n", encoding="utf-8")
+
     def det_and_cls(self, frame_bgr: np.ndarray, stop_event=None):
         """Run detection/segmentation, then crop+classification.
 
-        Returns: (valid_boxes_xyxy, valid_names, valid_confs, (w, h))
+        Returns: (valid_boxes_xyxy, valid_names, valid_confs, valid_area_types, (w, h))
         where boxes are expanded crop boxes and remain compatible with the Unity client.
         """
         h, w = frame_bgr.shape[:2]
+        debug_dump_dir, debug_meta = self._open_debug_dump(frame_bgr)
 
         det_res = self.det_model.predict(
             frame_bgr,
@@ -325,12 +428,19 @@ class VisionPipeline:
 
         boxes = self._extract_detection_boxes(det_res)
         if boxes.shape[0] == 0:
-            return [], [], [], (w, h)
+            if debug_meta is not None:
+                debug_meta.append("detections=0")
+            self._finish_debug_dump(debug_dump_dir, debug_meta)
+            return [], [], [], [], (w, h)
 
+        det_classes = self._extract_detection_classes(det_res)
         masks = self._extract_masks(det_res)
+        if debug_meta is not None:
+            debug_meta.append(f"detections={boxes.shape[0]}")
 
         cls_names: List[str] = []
         cls_confs: List[float] = []
+        area_types: List[Optional[str]] = []
         crops_xyxy: List[Optional[Box]] = []
 
         for i, b in enumerate(boxes):
@@ -342,6 +452,7 @@ class VisionPipeline:
                 crops_xyxy.append(None)
                 cls_names.append("")
                 cls_confs.append(0.0)
+                area_types.append(None)
                 continue
 
             crops_xyxy.append(eb)
@@ -353,15 +464,22 @@ class VisionPipeline:
             cname, cconf = self.classify_crop(crop)
             cls_names.append(cname)
             cls_confs.append(float(cconf))
+            class_id = int(det_classes[i]) if i < len(det_classes) else -1
+            area_type = self._area_type_for_class(class_id)
+            area_types.append(area_type)
+            self._save_debug_crop(debug_dump_dir, debug_meta, i, area_type, cname, float(cconf), eb, crop)
 
         valid_boxes: List[Box] = []
         valid_names: List[str] = []
         valid_confs: List[float] = []
-        for eb, name, conf in zip(crops_xyxy, cls_names, cls_confs):
+        valid_area_types: List[Optional[str]] = []
+        for eb, name, conf, area_type in zip(crops_xyxy, cls_names, cls_confs, area_types):
             if eb is None:
                 continue
             valid_boxes.append(eb)
             valid_names.append(name)
             valid_confs.append(conf)
+            valid_area_types.append(area_type)
 
-        return valid_boxes, valid_names, valid_confs, (w, h)
+        self._finish_debug_dump(debug_dump_dir, debug_meta)
+        return valid_boxes, valid_names, valid_confs, valid_area_types, (w, h)

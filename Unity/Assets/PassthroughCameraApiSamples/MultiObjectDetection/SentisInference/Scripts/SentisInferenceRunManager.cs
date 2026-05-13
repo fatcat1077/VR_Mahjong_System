@@ -26,8 +26,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         [SerializeField] private string m_serverIp = "127.0.0.1";
         [SerializeField] private int m_serverPort = 5000;
 
-        [Tooltip("你要每秒一張就填 1")]
-        [SerializeField, Range(1, 30)] private int m_sendFps = 1;
+        [Tooltip("Frames per second to stream to PC. Use 10+ so the PC can confirm 5 stable hand-count frames quickly.")]
+        [SerializeField, Range(1, 30)] private int m_sendFps = 10;
 
         [SerializeField, Range(10, 100)] private int m_jpegQuality = 85;
 
@@ -36,6 +36,10 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         [SerializeField] private bool m_autoReconnect = true;
         [SerializeField] private float m_reconnectIntervalSec = 2f;
+
+        [Header("Stream Debug")]
+        [SerializeField] private bool m_showStreamDebug = true;
+        [SerializeField] private float m_debugUiIntervalSec = 0.5f;
 
         // Networking
         private TcpClient _client;
@@ -56,6 +60,17 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         private float _nextSendTime;
         private float _nextReconnectTime;
+        private float _nextDebugUiTime;
+
+        // Debug counters. Keep these independent from the stream protocol.
+        private int _connectAttempts;
+        private int _framesQueued;
+        private int _framesSent;
+        private int _responsesReceived;
+        private int _jsonParseErrors;
+        private int _sendFailures;
+        private int _recvFailures;
+        private int _lastSentBytes;
 
         // =========================================================
         // ✅ Original Sentis fields (保留，避免 Editor/其他腳本報錯)
@@ -209,6 +224,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             // receive & update UI (main thread)
             ProcessRecvQueue();
+
+            UpdateLocalStreamDebug();
         }
 
         private void Connect()
@@ -217,6 +234,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             try
             {
+                Interlocked.Increment(ref _connectAttempts);
                 _client = new TcpClient();
                 _client.NoDelay = true;
                 _client.Connect(m_serverIp, m_serverPort);
@@ -318,6 +336,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 _cpuTex.LoadRawTextureData(data);
                 _cpuTex.Apply(false);
                 _pendingJpeg = ImageConversion.EncodeToJPG(_cpuTex, m_jpegQuality);
+                Interlocked.Increment(ref _framesQueued);
             }
             catch { }
         }
@@ -333,6 +352,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             RenderTexture.active = prev;
 
             _pendingJpeg = ImageConversion.EncodeToJPG(_cpuTex, m_jpegQuality);
+            Interlocked.Increment(ref _framesQueued);
         }
 
         private void SendLoop()
@@ -359,18 +379,24 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                     header[2] = (byte)((len >> 8) & 0xFF);
                     header[3] = (byte)(len & 0xFF);
 
+                    byte[] packet = new byte[4 + jpg.Length];
+                    Buffer.BlockCopy(header, 0, packet, 0, 4);
+                    Buffer.BlockCopy(jpg, 0, packet, 4, jpg.Length);
+
                     lock (_sendLock)
                     {
-                        _stream.Write(header, 0, 4);
-                        _stream.Write(jpg, 0, jpg.Length);
+                        _stream.Write(packet, 0, packet.Length);
                         _stream.Flush();
                     }
 
+                    Interlocked.Increment(ref _framesSent);
+                    Interlocked.Exchange(ref _lastSentBytes, len);
                     Debug.Log($"[Stream] Sent frame: {len / 1024f:0.0} KB");
                 }
             }
             catch (Exception e)
             {
+                Interlocked.Increment(ref _sendFailures);
                 Debug.LogWarning($"[Stream] SendLoop stopped: {e.Message}");
                 m_menuUi?.SetConnectionState(false, "SendLoop stopped", e.Message);
             }
@@ -450,6 +476,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             }
             catch (Exception e)
             {
+                Interlocked.Increment(ref _recvFailures);
                 Debug.LogWarning($"[Stream] RecvLoop stopped: {e.Message}");
                 m_menuUi?.SetConnectionState(false, "RecvLoop stopped", e.Message);
             }
@@ -470,6 +497,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             {
                 var resp = JsonUtility.FromJson<ServerResponse>(latest);
                 if (resp == null) return;
+                Interlocked.Increment(ref _responsesReceived);
 
                 // Update prompt panel (preferred)
                 if (m_menuUi != null)
@@ -491,8 +519,25 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             }
             catch (Exception e)
             {
+                Interlocked.Increment(ref _jsonParseErrors);
                 Debug.LogWarning($"[Stream] JSON parse failed: {e.Message}");
             }
+        }
+
+        private void UpdateLocalStreamDebug()
+        {
+            if (!m_showStreamDebug || m_menuUi == null) return;
+            if (Time.unscaledTime < _nextDebugUiTime) return;
+            _nextDebugUiTime = Time.unscaledTime + Mathf.Max(0.1f, m_debugUiIntervalSec);
+
+            string pending = _pendingJpeg != null ? "yes" : "no";
+            string capture = _captureInFlight ? "yes" : "no";
+            string debug =
+                $"[QUEST] stream={(_connected ? "connected" : "disconnected")} " +
+                $"targetFps={m_sendFps} queued={_framesQueued} sent={_framesSent} recv={_responsesReceived} " +
+                $"pending={pending} capture={capture} lastKB={_lastSentBytes / 1024f:0.0} " +
+                $"connects={_connectAttempts} sendErr={_sendFailures} recvErr={_recvFailures} jsonErr={_jsonParseErrors}";
+            m_menuUi.SetStreamDebug(debug);
         }
 
         // =========================================================
