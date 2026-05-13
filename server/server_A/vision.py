@@ -183,6 +183,10 @@ class VisionPipeline:
                 self.torch_device = torch.device("cpu")
 
         self.det_model = YOLO(yolo_path)
+        self.det_task = getattr(self.det_model, "task", None)
+        print(f"[DET] Loaded model task={self.det_task} | path={yolo_path}")
+        if self.det_task not in ("detect", "segment"):
+            print("[DET] Warning: detection model task is neither 'detect' nor 'segment'.")
 
         self.cls_backend = "torch"
         self.cls_model = None
@@ -225,6 +229,61 @@ class VisionPipeline:
             return None
         return (x1, y1, x2, y2)
 
+    def _extract_detection_boxes(self, det_res) -> np.ndarray:
+        """Return boxes in xyxy regardless of detect/segment backend output."""
+        if getattr(det_res, "boxes", None) is None or len(det_res.boxes) == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        return det_res.boxes.xyxy.cpu().numpy()
+
+    def _extract_masks(self, det_res) -> Optional[np.ndarray]:
+        """Return segmentation masks as uint8 array (N,H,W) or None."""
+        masks = getattr(det_res, "masks", None)
+        if masks is None or getattr(masks, "data", None) is None:
+            return None
+        try:
+            arr = masks.data.detach().cpu().numpy()
+        except Exception:
+            return None
+        if arr.ndim != 3 or arr.shape[0] == 0:
+            return None
+        return (arr > 0.5).astype(np.uint8)
+
+    def _make_classification_crop(
+        self,
+        frame_bgr: np.ndarray,
+        box: Box,
+        mask: Optional[np.ndarray],
+        full_w: int,
+        full_h: int,
+    ) -> np.ndarray:
+        """Create classifier crop.
+
+        - detect model: returns padded bbox crop
+        - segment model: applies binary mask inside padded bbox, keeping other pixels black
+        """
+        x1, y1, x2, y2 = box
+        crop = frame_bgr[y1:y2, x1:x2].copy()
+        if crop.size == 0:
+            return crop
+
+        if mask is None:
+            return crop
+
+        # Resize / align mask to image if needed, then crop with the same box.
+        mh, mw = mask.shape[:2]
+        if mh != full_h or mw != full_w:
+            mask = cv2.resize(mask.astype(np.uint8), (full_w, full_h), interpolation=cv2.INTER_NEAREST)
+        mask_crop = mask[y1:y2, x1:x2]
+        if mask_crop.shape[:2] != crop.shape[:2]:
+            mask_crop = cv2.resize(mask_crop.astype(np.uint8), (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        mask_crop = (mask_crop > 0).astype(np.uint8)
+        if mask_crop.sum() == 0:
+            return crop
+
+        crop[mask_crop == 0] = 0
+        return crop
+
     def classify_crop(self, crop_bgr: np.ndarray):
         if self.cls_backend == "ultralytics":
             cls_res = self.cls_model.predict(
@@ -248,10 +307,10 @@ class VisionPipeline:
         return cname, cconf
 
     def det_and_cls(self, frame_bgr: np.ndarray, stop_event=None):
-        """Run detection, then crop+classification.
+        """Run detection/segmentation, then crop+classification.
 
-        Returns: (valid_boxes_xyxy, valid_names, valid_confs)
-        where boxes are expanded crop boxes.
+        Returns: (valid_boxes_xyxy, valid_names, valid_confs, (w, h))
+        where boxes are expanded crop boxes and remain compatible with the Unity client.
         """
         h, w = frame_bgr.shape[:2]
 
@@ -264,16 +323,17 @@ class VisionPipeline:
             verbose=False,
         )[0]
 
-        if det_res.boxes is None or len(det_res.boxes) == 0:
+        boxes = self._extract_detection_boxes(det_res)
+        if boxes.shape[0] == 0:
             return [], [], [], (w, h)
 
-        boxes = det_res.boxes.xyxy.cpu().numpy()
+        masks = self._extract_masks(det_res)
 
         cls_names: List[str] = []
         cls_confs: List[float] = []
         crops_xyxy: List[Optional[Box]] = []
 
-        for b in boxes:
+        for i, b in enumerate(boxes):
             if stop_event is not None and stop_event.is_set():
                 raise InterruptedError("Stopped by user.")
 
@@ -285,8 +345,10 @@ class VisionPipeline:
                 continue
 
             crops_xyxy.append(eb)
-            x1, y1, x2, y2 = eb
-            crop = frame_bgr[y1:y2, x1:x2]
+            mask_i = None
+            if masks is not None and i < masks.shape[0]:
+                mask_i = masks[i]
+            crop = self._make_classification_crop(frame_bgr, eb, mask_i, w, h)
 
             cname, cconf = self.classify_crop(crop)
             cls_names.append(cname)

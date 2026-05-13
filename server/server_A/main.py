@@ -299,7 +299,7 @@ class InferServer:
 
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--yolo", required=True, help="path to yolo detection .pt")
+    ap.add_argument("--yolo", required=True, help="path to YOLO detect/segment .pt")
     ap.add_argument("--cls", required=True, help="path to classification .pt/.pth (MobileNetV3 Small weights)")
 
     ap.add_argument("--host", default="0.0.0.0")

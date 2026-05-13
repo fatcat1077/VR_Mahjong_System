@@ -47,3 +47,5 @@ python server.py `
   --dump-dir dumps `
   --dump-every 10 `
   --dump-on-empty
+
+   python server_dump.py --yolo C:\Users\user\Desktop\VR_project\screen_shot\yolo.pt --cls  C:\Users\user\Desktop\VR_project\screen_shot\best_classify.pt --host 0.0.0.0 --port 5000 `--print-interval 1 --dump-dir dumps --dump-every 10 --dump-on-empty
