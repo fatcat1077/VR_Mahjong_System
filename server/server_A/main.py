@@ -49,6 +49,7 @@ class InferServer:
         device: Optional[str],
         cls_labels_path: Optional[str] = None,
         cls_nc: Optional[int] = None,
+        cls_conf_threshold: float = 0.5,
         ppo_model_path: Optional[str] = None,
         ppo_device: Optional[str] = None,
         client_idle_timeout: float = 5.0,
@@ -74,6 +75,7 @@ class InferServer:
             device=device,
             cls_labels_path=cls_labels_path,
             cls_nc=cls_nc,
+            cls_conf_threshold=cls_conf_threshold,
             debug_dir=debug_vision_dir,
             debug_interval_sec=debug_vision_interval,
         )
@@ -446,11 +448,12 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=5000)
 
-    ap.add_argument("--det-imgsz", type=int, default=640)
+    ap.add_argument("--det-imgsz", type=int, default=960)
     ap.add_argument("--det-conf", type=float, default=0.25)
     ap.add_argument("--det-iou", type=float, default=0.45)
 
     ap.add_argument("--cls-imgsz", type=int, default=96)
+    ap.add_argument("--cls-conf", type=float, default=0.5, help="drop classify results below this confidence")
     ap.add_argument("--cls-labels", default=None, help="optional labels txt (one class name per line)")
     ap.add_argument("--cls-nc", type=int, default=None, help="optional override num_classes if inference fails")
 
@@ -503,6 +506,7 @@ def main():
         device=args.device,
         cls_labels_path=args.cls_labels,
         cls_nc=args.cls_nc,
+        cls_conf_threshold=args.cls_conf,
         ppo_model_path=args.ppo_model,
         ppo_device=args.ppo_device,
         client_idle_timeout=args.client_idle_timeout,

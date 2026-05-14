@@ -17,6 +17,9 @@ namespace PassthroughCameraSamples.MultiObjectDetection
     {
         [Header("Ui buttons")]
         [SerializeField] private OVRInput.RawButton m_actionButton = OVRInput.RawButton.A;
+        [SerializeField] private OVRInput.RawButton m_recenterPromptButton = OVRInput.RawButton.B;
+        [SerializeField] private OVRInput.Button m_recenterPromptVirtualButton = OVRInput.Button.Two;
+        [SerializeField] private KeyCode m_recenterPromptKey = KeyCode.B;
 
         [Header("Ui elements ref.")]
         [SerializeField] private GameObject m_loadingPanel;
@@ -27,7 +30,9 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         [Header("Prompt Display")]
         [Tooltip("If true, connection/advice/pc log will be printed into m_labelInfromation.")]
-        [SerializeField] private bool m_useLabelForPrompt = false;
+        [SerializeField] private bool m_useLabelForPrompt = true;
+        [Tooltip("Temporary: keep a second copy in the bottom panel while validating the side prompt.")]
+        [SerializeField] private bool m_showBottomPromptCopy = true;
 
         [Header("DebugUIBuilder Prompt Box (optional)")]
         [Tooltip("If true, also show a StartScene-style big prompt box using DebugUIBuilder.")]
@@ -101,6 +106,13 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         private void Update()
         {
+            if (OVRInput.GetUp(m_recenterPromptButton) ||
+                OVRInput.GetUp(m_recenterPromptVirtualButton) ||
+                Input.GetKeyUp(m_recenterPromptKey))
+            {
+                RecenterPromptPanel();
+            }
+
             if (!IsInputActive)
                 return;
 
@@ -110,6 +122,17 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             }
         }
         #endregion
+
+        public void RecenterPromptPanel()
+        {
+            TryBuildPromptPanel();
+
+            var ui = DebugUIBuilder.Instance;
+            if (ui == null || !_promptBuilt)
+                return;
+
+            ui.ShowAtCurrentHeadPose();
+        }
 
         #region Ui state: No permissions Menu
         private void OnNoPermissionMenu()
@@ -263,7 +286,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             var displayText = BuildPromptDisplayText(text);
 
             // 1) Existing bottom label. Default is off so the Quest view has one menu only.
-            if (m_useLabelForPrompt && m_labelInfromation != null)
+            if ((m_useLabelForPrompt || m_showBottomPromptCopy) && m_labelInfromation != null)
             {
                 m_labelInfromation.supportRichText = true;
                 m_labelInfromation.text = displayText;

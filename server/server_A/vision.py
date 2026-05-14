@@ -174,6 +174,7 @@ class VisionPipeline:
         device: Optional[str] = None,
         cls_labels_path: Optional[str] = None,
         cls_nc: Optional[int] = None,
+        cls_conf_threshold: float = 0.5,
         debug_dir: Optional[str] = None,
         debug_interval_sec: float = 1.0,
     ):
@@ -181,6 +182,7 @@ class VisionPipeline:
         self.det_conf = float(det_conf)
         self.det_iou = float(det_iou)
         self.cls_imgsz = int(cls_imgsz)
+        self.cls_conf_threshold = float(cls_conf_threshold)
         self.crop_pad = float(crop_pad)
         self.device = device  # for ultralytics.predict
         self.debug_dir = Path(debug_dir) if debug_dir else None
@@ -375,6 +377,7 @@ class VisionPipeline:
             f"crop_pad={self.crop_pad}",
             f"cls_backend={self.cls_backend}",
             f"cls_imgsz={self.cls_imgsz}",
+            f"cls_conf_threshold={self.cls_conf_threshold}",
         ]
         return dump_dir, meta
 
@@ -400,6 +403,7 @@ class VisionPipeline:
         cv2.imwrite(str(input_path), self._prepare_classification_input(crop_bgr))
         meta.append(
             f"{index:02d}: area={area_type or 'unknown'} label={label} conf={conf:.4f} "
+            f"accepted={conf >= self.cls_conf_threshold} "
             f"box={tuple(int(v) for v in box)} crop={crop_path.name} input={input_path.name}"
         )
 
@@ -437,6 +441,7 @@ class VisionPipeline:
         masks = self._extract_masks(det_res)
         if debug_meta is not None:
             debug_meta.append(f"detections={boxes.shape[0]}")
+            debug_meta.append(f"classify_accept_conf>={self.cls_conf_threshold}")
 
         cls_names: List[str] = []
         cls_confs: List[float] = []
@@ -475,6 +480,8 @@ class VisionPipeline:
         valid_area_types: List[Optional[str]] = []
         for eb, name, conf, area_type in zip(crops_xyxy, cls_names, cls_confs, area_types):
             if eb is None:
+                continue
+            if float(conf) < self.cls_conf_threshold:
                 continue
             valid_boxes.append(eb)
             valid_names.append(name)

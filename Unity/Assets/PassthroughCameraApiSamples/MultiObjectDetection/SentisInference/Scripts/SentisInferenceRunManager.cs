@@ -26,13 +26,16 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         [SerializeField] private string m_serverIp = "127.0.0.1";
         [SerializeField] private int m_serverPort = 5000;
 
-        [Tooltip("Frames per second to stream to PC. Use 10+ so the PC can confirm 5 stable hand-count frames quickly.")]
-        [SerializeField, Range(1, 30)] private int m_sendFps = 10;
+        [Tooltip("Frames per second to stream to PC. Higher resolution needs a little more bandwidth/headroom.")]
+        [SerializeField, Range(1, 30)] private int m_sendFps = 8;
 
-        [SerializeField, Range(10, 100)] private int m_jpegQuality = 85;
+        [SerializeField, Range(10, 100)] private int m_jpegQuality = 92;
 
-        [Tooltip("固定輸出尺寸（會把來源 Blit 到這個大小）")]
-        [SerializeField] private Vector2Int m_streamSize = new(640, 640);
+        [Tooltip("固定輸出尺寸（會把來源 Blit 到這個大小）。Use 4:3 to avoid squashing the camera image.")]
+        [SerializeField] private Vector2Int m_streamSize = new(1280, 960);
+
+        [Tooltip("Keep stream settings at the high-resolution defaults even if an old scene/prefab serialized lower values.")]
+        [SerializeField] private bool m_forceHighResolutionStreamDefaults = true;
 
         [SerializeField] private bool m_autoReconnect = true;
         [SerializeField] private float m_reconnectIntervalSec = 2f;
@@ -121,6 +124,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             if (m_streamOnly)
             {
+                NormalizeStreamSettings();
                 // Stream only：不載 Sentis
                 IsModelLoaded = true;
                 Connect();
@@ -206,6 +210,19 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         // =========================================================
         // ✅ Stream-only implementation
         // =========================================================
+        private void NormalizeStreamSettings()
+        {
+            if (!m_forceHighResolutionStreamDefaults)
+                return;
+
+            if (m_streamSize.x < 1280 || m_streamSize.y < 960)
+            {
+                m_streamSize = new Vector2Int(1280, 960);
+            }
+            m_jpegQuality = Mathf.Max(m_jpegQuality, 92);
+            m_sendFps = Mathf.Clamp(m_sendFps, 1, 8);
+        }
+
         private void StreamUpdate()
         {
             // auto reconnect
@@ -534,7 +551,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             string capture = _captureInFlight ? "yes" : "no";
             string debug =
                 $"[QUEST] stream={(_connected ? "connected" : "disconnected")} " +
-                $"targetFps={m_sendFps} queued={_framesQueued} sent={_framesSent} recv={_responsesReceived} " +
+                $"targetFps={m_sendFps} size={m_streamSize.x}x{m_streamSize.y} q={m_jpegQuality} " +
+                $"queued={_framesQueued} sent={_framesSent} recv={_responsesReceived} " +
                 $"pending={pending} capture={capture} lastKB={_lastSentBytes / 1024f:0.0} " +
                 $"connects={_connectAttempts} sendErr={_sendFailures} recvErr={_recvFailures} jsonErr={_jsonParseErrors}";
             m_menuUi.SetStreamDebug(debug);

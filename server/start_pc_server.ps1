@@ -28,8 +28,9 @@ foreach ($Path in @($Yolo, $Cls, $Ppo)) {
     --port 5000 `
     --client-idle-timeout 5 `
     --print-interval 1 `
-    --det-imgsz 640 `
+    --det-imgsz 960 `
     --cls-imgsz 96 `
+    --cls-conf 0.5 `
     --debug-vision `
     --debug-dir $DebugDir `
     --debug-interval 1
