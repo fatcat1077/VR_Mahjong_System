@@ -34,12 +34,12 @@ _CANONICAL_ID_TO_LABEL = (
     [f"{i}m" for i in range(1, 10)]
     + [f"{i}p" for i in range(1, 10)]
     + [f"{i}s" for i in range(1, 10)]
-    + ["E", "S", "W", "N", "P", "F", "C"]
+    + ["east", "south", "west", "north", "white", "green", "red"]
 )
 
 PHASE_DISCARD = 0
 PHASE_CLAIM = 1
-TURN_STABLE_FRAMES = 5
+TURN_STABLE_FRAMES = 7
 TURN_CORRECTION_COOLDOWN_FRAMES = 15
 OBS_DIM = 175
 ACTION_DIM = 39
@@ -352,6 +352,7 @@ class GameStateTracker:
         self.frame_index = 0
         self.cooldown_frames_remaining = 0
         self._expected_discarder = 0
+        self._self_discard_turn_active = False
         self._stable_hand_count: Optional[int] = None
         self._recent_hand_counts.clear()
         self._table_candidate_signature: Optional[Tuple[Tuple[int, int, int], ...]] = None
@@ -360,6 +361,7 @@ class GameStateTracker:
         self._stable_table_signature: Optional[Tuple[Tuple[int, int, int], ...]] = None
         self._stable_table_obs: List[Dict[str, Any]] = []
         self._reset_table_baseline_on_next_stable = False
+        self._pending_self_table_tile: Optional[int] = None
         self._last_live_info: Dict[str, Any] = {}
 
     def _normalize_table_observations(self, table_observations: Optional[Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -449,6 +451,7 @@ class GameStateTracker:
         self.current_player = 0
         self.phase = PHASE_DISCARD
         self._expected_discarder = 0
+        self._self_discard_turn_active = True
         self._reset_table_baseline_on_next_stable = True
         self.cooldown_frames_remaining = self._cooldown_frames
 
@@ -463,6 +466,7 @@ class GameStateTracker:
 
         if discarder == 0:
             self.phase = PHASE_DISCARD
+            self._self_discard_turn_active = False
         else:
             self.phase = PHASE_CLAIM
 
@@ -475,6 +479,42 @@ class GameStateTracker:
             "cx": float(obs.get("cx", 0.0)),
             "cy": float(obs.get("cy", 0.0)),
         }
+
+    def complete_self_discard_from_hand(self, tile_id: int) -> Dict[str, Any]:
+        tile_id = int(tile_id)
+        self.discards[0].append(tile_id)
+        self.last_discard = tile_id
+        self.last_discarder = 0
+        self._expected_discarder = 1
+        self.current_player = 1
+        self.phase = PHASE_DISCARD
+        self._self_discard_turn_active = False
+        self._pending_self_table_tile = tile_id
+        self._reset_table_baseline_on_next_stable = False
+        return {
+            "type": "self_discard_left_hand",
+            "discarder": 0,
+            "tile_id": tile_id,
+            "tile": tile_id_to_label(tile_id),
+        }
+
+    def _accept_pending_self_table_baseline(self, cur_obs: List[Dict[str, Any]], new_obs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        expected_tile = self._pending_self_table_tile
+        matched = any(int(obs.get("tile_id", -1)) == int(expected_tile) for obs in new_obs) if expected_tile is not None else False
+        self._stable_table_signature = self._table_signature(cur_obs)
+        self._stable_table_obs = cur_obs
+        self._pending_self_table_tile = None
+        return {
+            "type": "table_self_discard_baseline",
+            "tile_id": int(expected_tile) if expected_tile is not None else -1,
+            "tile": tile_id_to_label(int(expected_tile)) if expected_tile is not None else "",
+            "matched": bool(matched),
+            "count": len(cur_obs),
+        }
+
+    def stable_table_labels(self) -> List[str]:
+        """Return the locked stable table state for display."""
+        return sorted_tile_labels_from_ids([int(obs["tile_id"]) for obs in self._stable_table_obs])
 
     def update_live_state(
         self,
@@ -491,9 +531,13 @@ class GameStateTracker:
         corrected = False
         if hand_stable:
             self._stable_hand_count = hand_count
-            if is_self_discard_turn_by_hand_count(detected_hand_tiles) and self.can_correct_this_frame():
+            is_self_turn_hand = is_self_discard_turn_by_hand_count(detected_hand_tiles)
+            can_enter_self_turn = self.current_player == 0 or self.phase == PHASE_CLAIM
+            if is_self_turn_hand and not self._self_discard_turn_active and can_enter_self_turn:
                 self.correct_to_self_discard()
                 corrected = True
+            elif not is_self_turn_hand:
+                self._self_discard_turn_active = False
 
         table_events: List[Dict[str, Any]] = []
         table_obs = self._normalize_table_observations(table_observations)
@@ -523,18 +567,108 @@ class GameStateTracker:
                     }
                 )
             elif self._stable_table_signature != table_signature:
-                if self._stable_table_signature is None:
+                if self._pending_self_table_tile is not None:
+                    if self._stable_table_signature is None:
+                        self._stable_table_signature = table_signature
+                        self._stable_table_obs = cur_obs
+                        expected_tile = self._pending_self_table_tile
+                        self._pending_self_table_tile = None
+                        table_events.append(
+                            {
+                                "type": "table_self_discard_baseline",
+                                "tile_id": int(expected_tile) if expected_tile is not None else -1,
+                                "tile": tile_id_to_label(int(expected_tile)) if expected_tile is not None else "",
+                                "matched": any(
+                                    int(obs.get("tile_id", -1)) == int(expected_tile)
+                                    for obs in cur_obs
+                                )
+                                if expected_tile is not None
+                                else False,
+                                "count": len(cur_obs),
+                            }
+                        )
+                    elif len(cur_obs) == len(prev_obs) + 1:
+                        new_obs = self._find_new_table_observations(prev_obs, cur_obs)
+                        if new_obs:
+                            table_events.append(self._accept_pending_self_table_baseline(cur_obs, new_obs))
+                        else:
+                            table_events.append(
+                                {
+                                    "type": "table_new_tile_unmatched",
+                                    "previous_count": len(prev_obs),
+                                    "current_count": len(cur_obs),
+                                }
+                            )
+                    elif len(cur_obs) == len(prev_obs):
+                        table_events.append(
+                            {
+                                "type": "table_waiting_self_discard_baseline",
+                                "count": len(cur_obs),
+                            }
+                        )
+                    elif len(cur_obs) > len(prev_obs) + 1:
+                        table_events.append(
+                            {
+                                "type": "table_count_jump_ignored",
+                                "previous_count": len(prev_obs),
+                                "current_count": len(cur_obs),
+                            }
+                        )
+                    else:
+                        table_events.append(
+                            {
+                                "type": "table_count_drop_ignored",
+                                "previous_count": len(prev_obs),
+                                "current_count": len(cur_obs),
+                            }
+                        )
+                elif self._stable_table_signature is None:
                     self._stable_table_signature = table_signature
                     self._stable_table_obs = cur_obs
-                elif len(cur_obs) > len(prev_obs):
+                    table_events.append(
+                        {
+                            "type": "table_baseline_stable",
+                            "count": len(cur_obs),
+                        }
+                    )
+                elif len(cur_obs) == len(prev_obs) + 1:
                     new_obs = self._find_new_table_observations(prev_obs, cur_obs)
-                    for obs in new_obs[: max(0, len(cur_obs) - len(prev_obs))]:
-                        table_events.append(self._accept_new_discard(obs))
-                    self._stable_table_signature = table_signature
-                    self._stable_table_obs = cur_obs
+                    if new_obs:
+                        if self._expected_discarder == 0 and self._self_discard_turn_active:
+                            table_events.append(
+                                {
+                                    "type": "table_waiting_self_discard_hand_exit",
+                                    "previous_count": len(prev_obs),
+                                    "current_count": len(cur_obs),
+                                }
+                            )
+                        else:
+                            table_events.append(self._accept_new_discard(new_obs[0]))
+                            self._stable_table_signature = table_signature
+                            self._stable_table_obs = cur_obs
+                    else:
+                        table_events.append(
+                            {
+                                "type": "table_new_tile_unmatched",
+                                "previous_count": len(prev_obs),
+                                "current_count": len(cur_obs),
+                            }
+                        )
                 elif len(cur_obs) == len(prev_obs):
-                    self._stable_table_signature = table_signature
-                    self._stable_table_obs = cur_obs
+                    table_events.append(
+                        {
+                            "type": "table_same_count_stable",
+                            "count": len(prev_obs),
+                        }
+                    )
+                elif len(cur_obs) > len(prev_obs) + 1:
+                    table_events.append(
+                        {
+                            "type": "table_count_jump_ignored",
+                            "previous_count": len(prev_obs),
+                            "current_count": len(cur_obs),
+                        }
+                    )
                 else:
                     table_events.append(
                         {

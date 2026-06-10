@@ -256,8 +256,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             var sb = new StringBuilder(512);
 
-            // PC log block (preferred). Keep the Quest overlay intentionally quiet:
-            // only hand tiles and the recommended discard should be visible here.
+            // PC log block (preferred). Keep the Quest overlay focused on the
+            // current hand, locked table, latest discard, turn, and recommendation.
             if (!string.IsNullOrEmpty(_pcLog))
             {
                 sb.AppendLine(_pcLog.TrimEnd());
@@ -273,7 +273,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                     var suggestedTile = !string.IsNullOrEmpty(benefitTile) ? benefitTile : safeTile;
 
                     sb.AppendLine($"手牌：{(!string.IsNullOrEmpty(handStr) ? handStr : "辨識中")}");
-                    sb.AppendLine($"建議動作：{(!string.IsNullOrEmpty(suggestedTile) ? "打 " + suggestedTile : "等待手牌穩定")}");
+                    sb.AppendLine($"建議動作：{(!string.IsNullOrEmpty(suggestedTile) ? "打 " + suggestedTile : "正在偵測出牌")}");
                 }
                 else
                 {
@@ -308,15 +308,30 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             var hand = ExtractLineValue(rawText, "手牌");
             var table = ExtractLineValue(rawText, "桌上牌");
             var action = ExtractLineValue(rawText, "建議動作");
+            var discard = ExtractLineValue(rawText, "出牌");
+            var turn = ExtractLineValue(rawText, "Turn");
+            var stableState = ExtractLineValue(rawText, "Stable");
 
             if (string.IsNullOrEmpty(hand)) hand = "辨識中";
             if (string.IsNullOrEmpty(table)) table = "辨識中";
             if (string.IsNullOrEmpty(action)) action = "等待 PC 回傳";
+            if (!string.IsNullOrEmpty(stableState))
+                hand = $"{hand} ({stableState})";
 
             var sb = new StringBuilder(512);
             AppendPromptSection(sb, "手牌", hand, "#9AE6B4", 34);
             sb.AppendLine();
             AppendPromptSection(sb, "桌上牌", table, "#93C5FD", 30);
+            if (!string.IsNullOrEmpty(discard))
+            {
+                sb.AppendLine();
+                AppendPromptSection(sb, "出牌", discard, "#FCA5A5", 32);
+            }
+            if (!string.IsNullOrEmpty(turn))
+            {
+                sb.AppendLine();
+                AppendPromptSection(sb, "Turn", turn, "#C4B5FD", 30);
+            }
             sb.AppendLine();
             AppendPromptSection(sb, "建議動作", action, "#FDE68A", 36);
             return sb.ToString().TrimEnd();

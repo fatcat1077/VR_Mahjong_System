@@ -44,6 +44,9 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         [SerializeField] private bool m_showStreamDebug = true;
         [SerializeField] private float m_debugUiIntervalSec = 0.5f;
 
+        [Header("Mahjong Scene Reset")]
+        [SerializeField] private OVRInput.RawButton m_resetSceneButton = OVRInput.RawButton.X;
+
         // Networking
         private TcpClient _client;
         private NetworkStream _stream;
@@ -74,6 +77,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         private int _sendFailures;
         private int _recvFailures;
         private int _lastSentBytes;
+        private int _sceneResetRequests;
 
         // =========================================================
         // ✅ Original Sentis fields (保留，避免 Editor/其他腳本報錯)
@@ -225,6 +229,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         private void StreamUpdate()
         {
+            HandleSceneResetInput();
+
             // auto reconnect
             if (!_connected && m_autoReconnect && Time.unscaledTime >= _nextReconnectTime)
             {
@@ -297,6 +303,41 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             _pendingJpeg = null;
             _captureInFlight = false;
+        }
+
+        private void HandleSceneResetInput()
+        {
+            if (OVRInput.GetUp(m_resetSceneButton) || Input.GetKeyUp(KeyCode.X))
+            {
+                SendSceneResetControl();
+            }
+        }
+
+        [Serializable]
+        private class SceneResetControl
+        {
+            public string type = "control";
+            public string command = "scene_reset";
+        }
+
+        private void SendSceneResetControl()
+        {
+            if (_stream == null || !_connected)
+                return;
+
+            try
+            {
+                var msg = new SceneResetControl();
+                var payload = Encoding.UTF8.GetBytes(JsonUtility.ToJson(msg));
+                WriteLengthPrefixed(payload);
+                Interlocked.Increment(ref _sceneResetRequests);
+                Debug.Log("[Stream] Scene reset requested");
+            }
+            catch (Exception e)
+            {
+                Interlocked.Increment(ref _sendFailures);
+                Debug.LogWarning($"[Stream] Scene reset control failed: {e.Message}");
+            }
         }
 
         private void EnsureBuffers()
@@ -372,6 +413,33 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             Interlocked.Increment(ref _framesQueued);
         }
 
+        private void WriteLengthPrefixed(byte[] payload)
+        {
+            if (payload == null || _stream == null)
+                return;
+
+            int len = payload.Length;
+
+            byte[] header = new byte[4];
+            header[0] = (byte)((len >> 24) & 0xFF);
+            header[1] = (byte)((len >> 16) & 0xFF);
+            header[2] = (byte)((len >> 8) & 0xFF);
+            header[3] = (byte)(len & 0xFF);
+
+            byte[] packet = new byte[4 + len];
+            Buffer.BlockCopy(header, 0, packet, 0, 4);
+            Buffer.BlockCopy(payload, 0, packet, 4, len);
+
+            lock (_sendLock)
+            {
+                if (_stream == null)
+                    return;
+
+                _stream.Write(packet, 0, packet.Length);
+                _stream.Flush();
+            }
+        }
+
         private void SendLoop()
         {
             try
@@ -388,23 +456,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                     _pendingJpeg = null;
 
                     int len = jpg.Length;
-
-                    // 4-byte big-endian length prefix
-                    byte[] header = new byte[4];
-                    header[0] = (byte)((len >> 24) & 0xFF);
-                    header[1] = (byte)((len >> 16) & 0xFF);
-                    header[2] = (byte)((len >> 8) & 0xFF);
-                    header[3] = (byte)(len & 0xFF);
-
-                    byte[] packet = new byte[4 + jpg.Length];
-                    Buffer.BlockCopy(header, 0, packet, 0, 4);
-                    Buffer.BlockCopy(jpg, 0, packet, 4, jpg.Length);
-
-                    lock (_sendLock)
-                    {
-                        _stream.Write(packet, 0, packet.Length);
-                        _stream.Flush();
-                    }
+                    WriteLengthPrefixed(jpg);
 
                     Interlocked.Increment(ref _framesSent);
                     Interlocked.Exchange(ref _lastSentBytes, len);
@@ -433,6 +485,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             public int img_h;
             public SentisInferenceUiManager.RemoteTile[] tiles;
             public string[] hand;
+            public bool hand_stable;
             public SentisInferenceUiManager.Advice advice;
             public string pc_log;
         }
@@ -553,6 +606,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 $"[QUEST] stream={(_connected ? "connected" : "disconnected")} " +
                 $"targetFps={m_sendFps} size={m_streamSize.x}x{m_streamSize.y} q={m_jpegQuality} " +
                 $"queued={_framesQueued} sent={_framesSent} recv={_responsesReceived} " +
+                $"sceneReset={_sceneResetRequests} " +
                 $"pending={pending} capture={capture} lastKB={_lastSentBytes / 1024f:0.0} " +
                 $"connects={_connectAttempts} sendErr={_sendFailures} recvErr={_recvFailures} jsonErr={_jsonParseErrors}";
             m_menuUi.SetStreamDebug(debug);
