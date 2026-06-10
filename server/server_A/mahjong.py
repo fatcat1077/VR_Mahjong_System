@@ -1,6 +1,6 @@
 import re
 from collections import deque
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -9,6 +9,11 @@ try:
     from stable_baselines3 import PPO  # type: ignore
 except Exception:
     PPO = None  # type: ignore
+
+try:
+    from sb3_contrib import MaskablePPO  # type: ignore
+except Exception:
+    MaskablePPO = None  # type: ignore
 
 try:
     import torch
@@ -38,6 +43,11 @@ TURN_STABLE_FRAMES = 5
 TURN_CORRECTION_COOLDOWN_FRAMES = 15
 OBS_DIM = 175
 ACTION_DIM = 39
+ACT_PASS = 34
+ACT_PON = 35
+ACT_CHI_LOW = 36
+ACT_CHI_MID = 37
+ACT_CHI_HIGH = 38
 
 _ZH_NUM = {
     "一": 1,
@@ -315,13 +325,23 @@ def fallback_discard_tile(detected_hand_tiles: Sequence[int]) -> Optional[int]:
 
 
 class GameStateTracker:
-    """Minimal state needed to build the PPO observation from live vision."""
+    """Live game-state debouncer used to build PPO observations from vision."""
 
     def __init__(
         self,
         stable_frames: int = TURN_STABLE_FRAMES,
         cooldown_frames: int = TURN_CORRECTION_COOLDOWN_FRAMES,
+        table_pos_bucket: float = 0.025,
+        table_match_dist: float = 0.08,
     ):
+        self._stable_frames = max(1, int(stable_frames))
+        self._cooldown_frames = max(0, int(cooldown_frames))
+        self._table_pos_bucket = max(0.005, float(table_pos_bucket))
+        self._table_match_dist = max(0.01, float(table_match_dist))
+        self._recent_hand_counts = deque(maxlen=self._stable_frames)
+        self.reset_runtime()
+
+    def reset_runtime(self) -> None:
         self.current_player = 0
         self.phase = PHASE_DISCARD
         self.discards: List[List[int]] = [[], [], [], []]
@@ -331,24 +351,96 @@ class GameStateTracker:
         self.open_pon_count = 0
         self.frame_index = 0
         self.cooldown_frames_remaining = 0
-        self._recent_hand_counts = deque(maxlen=max(1, int(stable_frames)))
-        self._stable_frames = max(1, int(stable_frames))
-        self._cooldown_frames = max(0, int(cooldown_frames))
-
-    def reset_runtime(self) -> None:
-        self.frame_index = 0
-        self.cooldown_frames_remaining = 0
+        self._expected_discarder = 0
+        self._stable_hand_count: Optional[int] = None
         self._recent_hand_counts.clear()
+        self._table_candidate_signature: Optional[Tuple[Tuple[int, int, int], ...]] = None
+        self._table_candidate_frames = 0
+        self._table_candidate_obs: List[Dict[str, Any]] = []
+        self._stable_table_signature: Optional[Tuple[Tuple[int, int, int], ...]] = None
+        self._stable_table_obs: List[Dict[str, Any]] = []
+        self._reset_table_baseline_on_next_stable = False
+        self._last_live_info: Dict[str, Any] = {}
 
-    def update_hand_count_stability(self, detected_hand_tiles: Sequence[int]) -> bool:
-        self.frame_index += 1
-        if self.cooldown_frames_remaining > 0:
-            self.cooldown_frames_remaining -= 1
+    def _normalize_table_observations(self, table_observations: Optional[Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for obs in table_observations or []:
+            tile_id = obs.get("tile_id")
+            if tile_id is None:
+                tile_id = tile_label_to_id(str(obs.get("label", "")))
+            if tile_id is None or not (0 <= int(tile_id) < 34):
+                continue
+            normalized.append(
+                {
+                    "track_id": int(obs.get("track_id", obs.get("id", -1))),
+                    "tile_id": int(tile_id),
+                    "label": str(obs.get("label") or tile_id_to_label(int(tile_id))),
+                    "cx": float(obs.get("cx", 0.0)),
+                    "cy": float(obs.get("cy", 0.0)),
+                    "conf": float(obs.get("conf", 0.0)),
+                }
+            )
+        normalized.sort(key=lambda item: (item["cx"], item["cy"], item["tile_id"], item["track_id"]))
+        return normalized
 
-        self._recent_hand_counts.append(len(detected_hand_tiles))
-        if len(self._recent_hand_counts) < self._stable_frames:
-            return False
-        return len(set(self._recent_hand_counts)) == 1
+    def _table_signature(self, table_observations: Sequence[Dict[str, Any]]) -> Tuple[Tuple[int, int, int], ...]:
+        bucket = self._table_pos_bucket
+        return tuple(
+            sorted(
+                (
+                    int(obs["tile_id"]),
+                    int(round(float(obs["cx"]) / bucket)),
+                    int(round(float(obs["cy"]) / bucket)),
+                )
+                for obs in table_observations
+            )
+        )
+
+    @staticmethod
+    def _obs_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+        dx = float(a.get("cx", 0.0)) - float(b.get("cx", 0.0))
+        dy = float(a.get("cy", 0.0)) - float(b.get("cy", 0.0))
+        return float((dx * dx + dy * dy) ** 0.5)
+
+    def _find_new_table_observations(
+        self,
+        previous: Sequence[Dict[str, Any]],
+        current: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        unmatched = list(range(len(current)))
+
+        # First keep identities when the tracker ID survives.
+        for prev in previous:
+            prev_tid = int(prev.get("track_id", -1))
+            if prev_tid < 0:
+                continue
+            matched_idx = None
+            for idx in unmatched:
+                cur = current[idx]
+                if int(cur.get("track_id", -2)) == prev_tid and self._obs_distance(prev, cur) <= self._table_match_dist:
+                    matched_idx = idx
+                    break
+            if matched_idx is not None:
+                unmatched.remove(matched_idx)
+
+        # Then match same-label nearby tiles. This handles tracker-ID churn.
+        for prev in previous:
+            best_idx = None
+            best_dist = self._table_match_dist
+            for idx in unmatched:
+                cur = current[idx]
+                if int(cur["tile_id"]) != int(prev["tile_id"]):
+                    continue
+                dist = self._obs_distance(prev, cur)
+                if dist < best_dist:
+                    best_idx = idx
+                    best_dist = dist
+            if best_idx is not None:
+                unmatched.remove(best_idx)
+
+        new_items = [current[idx] for idx in unmatched]
+        new_items.sort(key=lambda item: (item["cx"], item["cy"], item["tile_id"]))
+        return new_items
 
     def can_correct_this_frame(self) -> bool:
         return self.cooldown_frames_remaining <= 0
@@ -356,7 +448,115 @@ class GameStateTracker:
     def correct_to_self_discard(self) -> None:
         self.current_player = 0
         self.phase = PHASE_DISCARD
+        self._expected_discarder = 0
+        self._reset_table_baseline_on_next_stable = True
         self.cooldown_frames_remaining = self._cooldown_frames
+
+    def _accept_new_discard(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        tile_id = int(obs["tile_id"])
+        discarder = int(self._expected_discarder)
+        self.discards[discarder].append(tile_id)
+        self.last_discard = tile_id
+        self.last_discarder = discarder
+        self._expected_discarder = (discarder + 1) % 4
+        self.current_player = self._expected_discarder
+
+        if discarder == 0:
+            self.phase = PHASE_DISCARD
+        else:
+            self.phase = PHASE_CLAIM
+
+        return {
+            "type": "table_discard",
+            "discarder": discarder,
+            "tile_id": tile_id,
+            "tile": tile_id_to_label(tile_id),
+            "track_id": int(obs.get("track_id", -1)),
+            "cx": float(obs.get("cx", 0.0)),
+            "cy": float(obs.get("cy", 0.0)),
+        }
+
+    def update_live_state(
+        self,
+        detected_hand_tiles: Sequence[int],
+        table_observations: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        self.frame_index += 1
+        if self.cooldown_frames_remaining > 0:
+            self.cooldown_frames_remaining -= 1
+
+        hand_count = len(detected_hand_tiles)
+        self._recent_hand_counts.append(hand_count)
+        hand_stable = len(self._recent_hand_counts) >= self._stable_frames and len(set(self._recent_hand_counts)) == 1
+        corrected = False
+        if hand_stable:
+            self._stable_hand_count = hand_count
+            if is_self_discard_turn_by_hand_count(detected_hand_tiles) and self.can_correct_this_frame():
+                self.correct_to_self_discard()
+                corrected = True
+
+        table_events: List[Dict[str, Any]] = []
+        table_obs = self._normalize_table_observations(table_observations)
+        table_signature = self._table_signature(table_obs)
+        table_stable = False
+
+        if table_signature == self._table_candidate_signature:
+            self._table_candidate_frames += 1
+            self._table_candidate_obs = table_obs
+        else:
+            self._table_candidate_signature = table_signature
+            self._table_candidate_frames = 1
+            self._table_candidate_obs = table_obs
+
+        if self._table_candidate_frames >= self._stable_frames:
+            table_stable = True
+            prev_obs = self._stable_table_obs
+            cur_obs = list(self._table_candidate_obs)
+            if self._reset_table_baseline_on_next_stable:
+                self._stable_table_signature = table_signature
+                self._stable_table_obs = cur_obs
+                self._reset_table_baseline_on_next_stable = False
+                table_events.append(
+                    {
+                        "type": "table_baseline_reset",
+                        "count": len(cur_obs),
+                    }
+                )
+            elif self._stable_table_signature != table_signature:
+                if self._stable_table_signature is None:
+                    self._stable_table_signature = table_signature
+                    self._stable_table_obs = cur_obs
+                elif len(cur_obs) > len(prev_obs):
+                    new_obs = self._find_new_table_observations(prev_obs, cur_obs)
+                    for obs in new_obs[: max(0, len(cur_obs) - len(prev_obs))]:
+                        table_events.append(self._accept_new_discard(obs))
+                    self._stable_table_signature = table_signature
+                    self._stable_table_obs = cur_obs
+                elif len(cur_obs) == len(prev_obs):
+                    self._stable_table_signature = table_signature
+                    self._stable_table_obs = cur_obs
+                else:
+                    table_events.append(
+                        {
+                            "type": "table_count_drop_ignored",
+                            "previous_count": len(prev_obs),
+                            "current_count": len(cur_obs),
+                        }
+                    )
+
+        info = {
+            "corrected": corrected,
+            "hand_stable": hand_stable,
+            "stable_count_frames": len(self._recent_hand_counts),
+            "stable_hand_count": self._stable_hand_count if hand_stable else None,
+            "table_stable": table_stable,
+            "table_candidate_frames": self._table_candidate_frames,
+            "stable_table_count": len(self._stable_table_obs),
+            "table_events": table_events,
+            "expected_discarder": self._expected_discarder,
+        }
+        self._last_live_info = info
+        return info
 
 
 def build_obs_from_tracker(tracker: GameStateTracker, detected_hand_tiles: Sequence[int]) -> np.ndarray:
@@ -379,13 +579,87 @@ def build_obs_from_tracker(tracker: GameStateTracker, detected_hand_tiles: Seque
     return obs
 
 
-def _topk_ppo_action_probs(rl_model, obs: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
+def _can_pon(hand_tiles: Sequence[int], tile_id: Optional[int]) -> bool:
+    if tile_id is None:
+        return False
+    return list(int(t) for t in hand_tiles).count(int(tile_id)) >= 2
+
+
+def _chi_variants(hand_tiles: Sequence[int], tile_id: Optional[int], discarder: Optional[int]) -> Dict[int, Tuple[int, int]]:
+    variants: Dict[int, Tuple[int, int]] = {}
+    if tile_id is None or discarder != 3 or int(tile_id) >= 27:
+        return variants
+    tile = int(tile_id)
+    hand = [int(t) for t in hand_tiles]
+    suit = tile // 9
+    idx = tile % 9
+    base = suit * 9
+
+    candidates = (
+        (ACT_CHI_LOW, idx >= 2, base + idx - 2, base + idx - 1),
+        (ACT_CHI_MID, 1 <= idx <= 7, base + idx - 1, base + idx + 1),
+        (ACT_CHI_HIGH, idx <= 6, base + idx + 1, base + idx + 2),
+    )
+    for action, ok, a, b in candidates:
+        if ok and hand.count(a) >= 1 and hand.count(b) >= 1:
+            variants[action] = (a, b)
+    return variants
+
+
+def legal_action_mask(tracker: GameStateTracker, hand_tiles: Sequence[int]) -> np.ndarray:
+    mask = np.zeros((ACTION_DIM,), dtype=bool)
+    clean_hand = [int(t) for t in hand_tiles if 0 <= int(t) < 34]
+
+    if tracker.phase == PHASE_CLAIM and tracker.last_discarder != 0:
+        mask[ACT_PASS] = True
+        if _can_pon(clean_hand, tracker.last_discard):
+            mask[ACT_PON] = True
+        for action in _chi_variants(clean_hand, tracker.last_discard, tracker.last_discarder):
+            mask[action] = True
+        return mask
+
+    if tracker.phase == PHASE_DISCARD and tracker.current_player == 0:
+        for tile in clean_hand:
+            mask[int(tile)] = True
+        if not mask.any():
+            mask[ACT_PASS] = True
+        return mask
+
+    mask[ACT_PASS] = True
+    return mask
+
+
+def _is_maskable_model(rl_model) -> bool:
+    if rl_model is None:
+        return False
+    name = type(rl_model).__name__.lower()
+    module = type(rl_model).__module__.lower()
+    return "maskable" in name or "sb3_contrib" in module
+
+
+def _predict_policy_action(rl_model, obs: np.ndarray, mask: np.ndarray) -> int:
+    if _is_maskable_model(rl_model):
+        action, _ = rl_model.predict(obs, deterministic=True, action_masks=mask)
+    else:
+        action, _ = rl_model.predict(obs, deterministic=True)
+    return int(action)
+
+
+def _topk_ppo_action_probs(
+    rl_model,
+    obs: np.ndarray,
+    top_k: int = 5,
+    action_mask: Optional[np.ndarray] = None,
+) -> List[Dict[str, Any]]:
     if rl_model is None or torch is None or top_k <= 0:
         return []
     try:
         device = getattr(rl_model, "device", "cpu")
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        dist = rl_model.policy.get_distribution(obs_t)
+        if _is_maskable_model(rl_model):
+            dist = rl_model.policy.get_distribution(obs_t, action_masks=action_mask)
+        else:
+            dist = rl_model.policy.get_distribution(obs_t)
         probs = dist.distribution.probs.squeeze(0).detach().cpu().numpy()
         idx = np.argsort(-probs)[:top_k]
         return [
@@ -416,90 +690,129 @@ def action_to_label(action: int) -> str:
     return str(action)
 
 
-def _empty_live_agent_result(detected_hand_tiles: Sequence[int], reason: str) -> Dict[str, Any]:
+def _empty_live_agent_result(
+    detected_hand_tiles: Sequence[int],
+    reason: str,
+    tracker: Optional[GameStateTracker] = None,
+    live_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     return {
         "corrected": False,
+        "current_player": tracker.current_player if tracker is not None else 0,
+        "phase": tracker.phase if tracker is not None else PHASE_DISCARD,
         "stable_count_frames": 0,
         "hand_count": len(detected_hand_tiles),
         "recommended_action": -1,
         "recommended_tile": "",
+        "decision_type": "none",
         "source": "none",
         "reason": reason,
         "topk": [],
+        "live": live_info or {},
     }
 
 
 def maybe_correct_self_turn_and_suggest(
     tracker: GameStateTracker,
     detected_hand_tiles: Sequence[int],
+    table_observations: Optional[Sequence[Dict[str, Any]]] = None,
     rl_model=None,
     top_k: int = 5,
 ) -> Dict[str, Any]:
-    """Correct Player0 discard phase from stable hand count and produce a legal discard."""
+    """Debounce live vision, update turn state, and ask the PPO policy when it is our decision."""
     hand_tiles = [int(t) for t in detected_hand_tiles if 0 <= int(t) < 34]
-    stable = tracker.update_hand_count_stability(hand_tiles)
+    live_info = tracker.update_live_state(hand_tiles, table_observations)
+    action_mask = legal_action_mask(tracker, hand_tiles)
 
-    if not stable:
-        result = _empty_live_agent_result(hand_tiles, "hand count is not stable yet")
-        result["stable_count_frames"] = len(tracker._recent_hand_counts)
+    if not live_info.get("hand_stable", False):
+        result = _empty_live_agent_result(hand_tiles, "hand count is not stable yet", tracker, live_info)
+        result["stable_count_frames"] = int(live_info.get("stable_count_frames", 0))
         return result
 
-    if not is_self_discard_turn_by_hand_count(hand_tiles):
-        result = _empty_live_agent_result(hand_tiles, "stable hand count is not 3n+2")
-        result["stable_count_frames"] = len(tracker._recent_hand_counts)
+    decision_type = "none"
+    if tracker.phase == PHASE_DISCARD and tracker.current_player == 0:
+        if not is_self_discard_turn_by_hand_count(hand_tiles):
+            result = _empty_live_agent_result(hand_tiles, "stable hand count is not 3n+2", tracker, live_info)
+            result["stable_count_frames"] = int(live_info.get("stable_count_frames", 0))
+            return result
+        decision_type = "discard"
+    elif tracker.phase == PHASE_CLAIM and tracker.last_discarder != 0:
+        decision_type = "claim"
+    else:
+        result = _empty_live_agent_result(hand_tiles, "waiting for another player's discard", tracker, live_info)
+        result["stable_count_frames"] = int(live_info.get("stable_count_frames", 0))
         return result
-
-    corrected = False
-    if tracker.can_correct_this_frame():
-        tracker.correct_to_self_discard()
-        corrected = True
 
     obs = build_obs_from_tracker(tracker, hand_tiles)
     source = "ppo"
-    reason = "PPO policy (deterministic) after Player0 discard-turn correction"
+    reason = (
+        "PPO policy (deterministic) for discard"
+        if decision_type == "discard"
+        else "PPO policy (deterministic) for claim/pass"
+    )
     action_id: Optional[int] = None
 
     if rl_model is not None:
         try:
-            action, _ = rl_model.predict(obs, deterministic=True)
-            action_id = int(action)
+            action_id = _predict_policy_action(rl_model, obs, action_mask)
         except Exception as e:
             source = "fallback"
-            reason = f"PPO predict failed; fallback discard ({e})"
-            action_id = fallback_discard_tile(hand_tiles)
+            if decision_type == "discard":
+                reason = f"PPO predict failed; fallback discard ({e})"
+                action_id = fallback_discard_tile(hand_tiles)
+            else:
+                reason = f"PPO predict failed; fallback PASS ({e})"
+                action_id = ACT_PASS
     else:
         source = "fallback"
-        reason = "PPO model not loaded; fallback discard"
-        action_id = fallback_discard_tile(hand_tiles)
+        if decision_type == "discard":
+            reason = "PPO model not loaded; fallback discard"
+            action_id = fallback_discard_tile(hand_tiles)
+        else:
+            reason = "PPO model not loaded; fallback PASS"
+            action_id = ACT_PASS
 
-    if action_id is None or not (0 <= action_id <= 33) or action_id not in hand_tiles:
+    if action_id is None or not (0 <= int(action_id) < ACTION_DIM) or not bool(action_mask[int(action_id)]):
         source = "fallback" if source == "ppo" else source
-        reason = "PPO action illegal for detected hand; fallback discard"
-        action_id = fallback_discard_tile(hand_tiles)
+        if decision_type == "discard":
+            reason = "PPO action illegal for detected hand; fallback discard"
+            action_id = fallback_discard_tile(hand_tiles)
+        else:
+            reason = "PPO action illegal for claim state; fallback PASS"
+            action_id = ACT_PASS
 
-    tile = tile_id_to_label(action_id) if action_id is not None else ""
+    if decision_type == "discard":
+        tile = tile_id_to_label(action_id) if action_id is not None and 0 <= int(action_id) < 34 else ""
+    else:
+        tile = action_to_label(int(action_id)) if action_id is not None else ""
 
     return {
-        "corrected": corrected,
+        "corrected": bool(live_info.get("corrected", False)),
         "current_player": tracker.current_player,
         "phase": tracker.phase,
-        "stable_count_frames": len(tracker._recent_hand_counts),
+        "stable_count_frames": int(live_info.get("stable_count_frames", 0)),
         "cooldown_frames_remaining": tracker.cooldown_frames_remaining,
         "hand_count": len(hand_tiles),
+        "last_discard": tracker.last_discard,
+        "last_discard_tile": tile_id_to_label(tracker.last_discard) if tracker.last_discard is not None else "",
+        "last_discarder": tracker.last_discarder,
         "recommended_action": int(action_id) if action_id is not None else -1,
         "recommended_tile": tile,
+        "decision_type": decision_type,
         "source": source,
         "reason": reason,
-        "topk": _topk_ppo_action_probs(rl_model, obs, top_k=top_k),
+        "action_mask": [bool(x) for x in action_mask.tolist()],
+        "topk": _topk_ppo_action_probs(rl_model, obs, top_k=top_k, action_mask=action_mask),
+        "live": live_info,
     }
 
 
 def load_ppo_model(ppo_model_path: Optional[str], ppo_device: Optional[str] = None):
-    """Load SB3 PPO model if available. Returns model or None."""
+    """Load SB3 PPO/MaskablePPO model if available. Returns model or None."""
     if not ppo_model_path:
         return None
-    if PPO is None:
-        print("[PPO] stable-baselines3 not installed. Install with: pip install stable-baselines3")
+    if PPO is None and MaskablePPO is None:
+        print("[PPO] stable-baselines3/sb3-contrib not installed.")
         return None
 
     try:
@@ -510,9 +823,22 @@ def load_ppo_model(ppo_model_path: Optional[str], ppo_device: Optional[str] = No
                 dev = "cuda"
             else:
                 dev = "cpu"
-        model = PPO.load(ppo_model_path, device=dev)
-        print(f"[PPO] Loaded PPO model: {ppo_model_path} (device={dev})")
-        return model
+        load_errors = []
+        if MaskablePPO is not None:
+            try:
+                model = MaskablePPO.load(ppo_model_path, device=dev)
+                print(f"[PPO] Loaded MaskablePPO model: {ppo_model_path} (device={dev})")
+                return model
+            except Exception as e:
+                load_errors.append(f"MaskablePPO: {e}")
+        if PPO is not None:
+            try:
+                model = PPO.load(ppo_model_path, device=dev)
+                print(f"[PPO] Loaded PPO model: {ppo_model_path} (device={dev})")
+                return model
+            except Exception as e:
+                load_errors.append(f"PPO: {e}")
+        raise RuntimeError("; ".join(load_errors))
     except Exception as e:
         print(f"[PPO] Failed to load model '{ppo_model_path}': {e}")
         return None

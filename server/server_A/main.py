@@ -183,6 +183,7 @@ class InferServer:
             agent_result = mahjong.maybe_correct_self_turn_and_suggest(
                 self.game_tracker,
                 detected_hand_tiles,
+                table_observations=[],
                 rl_model=self.ppo_model,
             )
             t_agent1 = time.perf_counter()
@@ -201,26 +202,44 @@ class InferServer:
                 "debug": debug_info,
             }
 
-        tracks = self.tracker.update(det_boxes, cls_names, cls_confs)
+        tracks = self.tracker.update(det_boxes, cls_names, cls_confs, area_types)
 
         tiles: List[Dict[str, Any]] = []
+        table_observations: List[Dict[str, Any]] = []
         for tr in tracks:
             x1, y1, x2, y2 = tr.bbox
             cx = ((x1 + x2) / 2.0) / w
             cy = ((y1 + y2) / 2.0) / h
             bw = (x2 - x1) / w
             bh = (y2 - y1) / h
+            stable_cls = tr.stable_cls()
+            stable_conf = tr.stable_conf()
+            stable_area_type = tr.stable_area_type()
             tiles.append(
                 {
                     "id": tr.id,
-                    "cls": tr.stable_cls(),
-                    "conf": tr.stable_conf(),
+                    "cls": stable_cls,
+                    "conf": stable_conf,
+                    "area": stable_area_type,
                     "cx": float(cx),
                     "cy": float(cy),
                     "w": float(bw),
                     "h": float(bh),
                 }
             )
+            if stable_area_type == "table":
+                tile_id = mahjong.tile_label_to_id(stable_cls)
+                if tile_id is not None:
+                    table_observations.append(
+                        {
+                            "track_id": int(tr.id),
+                            "tile_id": int(tile_id),
+                            "label": stable_cls,
+                            "conf": float(stable_conf),
+                            "cx": float(cx),
+                            "cy": float(cy),
+                        }
+                    )
 
         tiles.sort(key=lambda t: t["cx"])
         hand = mahjong.sorted_tile_labels_from_ids(detected_hand_tiles)
@@ -229,11 +248,14 @@ class InferServer:
         agent_result = mahjong.maybe_correct_self_turn_and_suggest(
             self.game_tracker,
             detected_hand_tiles,
+            table_observations=table_observations,
             rl_model=self.ppo_model,
         )
         t_agent1 = time.perf_counter()
         debug_info["agent_ms"] = (t_agent1 - t_agent0) * 1000.0
         debug_info["total_ms"] = (t_agent1 - t0) * 1000.0
+        debug_info["stable_table_count"] = agent_result.get("live", {}).get("stable_table_count", 0)
+        debug_info["table_events"] = agent_result.get("live", {}).get("table_events", [])
         suggested_tile_id = int(agent_result.get("recommended_action", -1))
         suggested_tile = str(agent_result.get("recommended_tile", ""))
         safe_tile_id = mahjong.fallback_discard_tile(detected_hand_tiles)
