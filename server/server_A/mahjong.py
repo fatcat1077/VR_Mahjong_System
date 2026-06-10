@@ -40,6 +40,7 @@ _CANONICAL_ID_TO_LABEL = (
 PHASE_DISCARD = 0
 PHASE_CLAIM = 1
 TURN_STABLE_FRAMES = 7
+TABLE_STABLE_FRAMES = 4
 TURN_CORRECTION_COOLDOWN_FRAMES = 15
 OBS_DIM = 175
 ACTION_DIM = 39
@@ -332,9 +333,10 @@ class GameStateTracker:
         stable_frames: int = TURN_STABLE_FRAMES,
         cooldown_frames: int = TURN_CORRECTION_COOLDOWN_FRAMES,
         table_pos_bucket: float = 0.025,
-        table_match_dist: float = 0.08,
+        table_match_dist: float = 0.12,
     ):
         self._stable_frames = max(1, int(stable_frames))
+        self._table_stable_frames = max(1, min(self._stable_frames, TABLE_STABLE_FRAMES))
         self._cooldown_frames = max(0, int(cooldown_frames))
         self._table_pos_bucket = max(0.005, float(table_pos_bucket))
         self._table_match_dist = max(0.01, float(table_match_dist))
@@ -355,10 +357,10 @@ class GameStateTracker:
         self._self_discard_turn_active = False
         self._stable_hand_count: Optional[int] = None
         self._recent_hand_counts.clear()
-        self._table_candidate_signature: Optional[Tuple[Tuple[int, int, int], ...]] = None
+        self._table_candidate_signature: Optional[Tuple[Tuple[int, int], ...]] = None
         self._table_candidate_frames = 0
         self._table_candidate_obs: List[Dict[str, Any]] = []
-        self._stable_table_signature: Optional[Tuple[Tuple[int, int, int], ...]] = None
+        self._stable_table_signature: Optional[Tuple[Tuple[int, int], ...]] = None
         self._stable_table_obs: List[Dict[str, Any]] = []
         self._reset_table_baseline_on_next_stable = False
         self._pending_self_table_tile: Optional[int] = None
@@ -385,18 +387,12 @@ class GameStateTracker:
         normalized.sort(key=lambda item: (item["cx"], item["cy"], item["tile_id"], item["track_id"]))
         return normalized
 
-    def _table_signature(self, table_observations: Sequence[Dict[str, Any]]) -> Tuple[Tuple[int, int, int], ...]:
-        bucket = self._table_pos_bucket
-        return tuple(
-            sorted(
-                (
-                    int(obs["tile_id"]),
-                    int(round(float(obs["cx"]) / bucket)),
-                    int(round(float(obs["cy"]) / bucket)),
-                )
-                for obs in table_observations
-            )
-        )
+    def _table_signature(self, table_observations: Sequence[Dict[str, Any]]) -> Tuple[Tuple[int, int], ...]:
+        counts: Dict[int, int] = {}
+        for obs in table_observations:
+            tile_id = int(obs["tile_id"])
+            counts[tile_id] = counts.get(tile_id, 0) + 1
+        return tuple(sorted(counts.items()))
 
     @staticmethod
     def _obs_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
@@ -529,14 +525,11 @@ class GameStateTracker:
         self._recent_hand_counts.append(hand_count)
         hand_stable = len(self._recent_hand_counts) >= self._stable_frames and len(set(self._recent_hand_counts)) == 1
         corrected = False
+        is_self_turn_hand = False
         if hand_stable:
             self._stable_hand_count = hand_count
             is_self_turn_hand = is_self_discard_turn_by_hand_count(detected_hand_tiles)
-            can_enter_self_turn = self.current_player == 0 or self.phase == PHASE_CLAIM
-            if is_self_turn_hand and not self._self_discard_turn_active and can_enter_self_turn:
-                self.correct_to_self_discard()
-                corrected = True
-            elif not is_self_turn_hand:
+            if not is_self_turn_hand:
                 self._self_discard_turn_active = False
 
         table_events: List[Dict[str, Any]] = []
@@ -552,7 +545,7 @@ class GameStateTracker:
             self._table_candidate_frames = 1
             self._table_candidate_obs = table_obs
 
-        if self._table_candidate_frames >= self._stable_frames:
+        if self._table_candidate_frames >= self._table_stable_frames:
             table_stable = True
             prev_obs = self._stable_table_obs
             cur_obs = list(self._table_candidate_obs)
@@ -678,6 +671,10 @@ class GameStateTracker:
                         }
                     )
 
+        if hand_stable and is_self_turn_hand and not self._self_discard_turn_active:
+            self.correct_to_self_discard()
+            corrected = True
+
         info = {
             "corrected": corrected,
             "hand_stable": hand_stable,
@@ -685,6 +682,7 @@ class GameStateTracker:
             "stable_hand_count": self._stable_hand_count if hand_stable else None,
             "table_stable": table_stable,
             "table_candidate_frames": self._table_candidate_frames,
+            "table_stable_required_frames": self._table_stable_frames,
             "stable_table_count": len(self._stable_table_obs),
             "table_events": table_events,
             "expected_discarder": self._expected_discarder,
