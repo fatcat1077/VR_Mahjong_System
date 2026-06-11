@@ -22,10 +22,10 @@ public static class QuestAppBuild
             apkPath = Path.GetFullPath(Path.Combine(projectRoot, apkPath));
         }
 
-        var scenes = EditorBuildSettings.scenes
-            .Where(scene => scene.enabled)
-            .Select(scene => scene.path)
-            .ToArray();
+        var sceneOverride = Environment.GetEnvironmentVariable("QUEST_SCENE_PATH");
+        var scenes = !string.IsNullOrWhiteSpace(sceneOverride)
+            ? new[] { sceneOverride }
+            : new[] { "Assets/PassthroughCameraApiSamples/MultiObjectDetection/MultiObjectDetection.unity" };
 
         if (scenes.Length == 0)
         {
@@ -41,6 +41,11 @@ public static class QuestAppBuild
         PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel32;
         PlayerSettings.Android.targetSdkVersion = AndroidSdkVersions.AndroidApiLevel32;
 
+        var ovrConfig = OVRProjectConfig.CachedProjectConfig;
+        var originalHandTrackingSupport = ovrConfig.handTrackingSupport;
+        var originalHandTrackingFrequency = ovrConfig.handTrackingFrequency;
+        var handTrackingSupport = ResolveHandTrackingSupport();
+
         var options = new BuildPlayerOptions
         {
             scenes = scenes,
@@ -50,13 +55,46 @@ public static class QuestAppBuild
             options = BuildOptions.None,
         };
 
-        var report = BuildPipeline.BuildPlayer(options);
-        var summary = report.summary;
-        Debug.Log($"[QuestAppBuild] result={summary.result} totalSize={summary.totalSize} output={apkPath}");
+        BuildSummary summary = default;
+        try
+        {
+            ovrConfig.handTrackingSupport = handTrackingSupport;
+            ovrConfig.handTrackingFrequency = OVRProjectConfig.HandTrackingFrequency.LOW;
+            EditorUtility.SetDirty(ovrConfig);
+            AssetDatabase.SaveAssets();
+
+            var report = BuildPipeline.BuildPlayer(options);
+            summary = report.summary;
+            Debug.Log($"[QuestAppBuild] result={summary.result} totalSize={summary.totalSize} output={apkPath}");
+        }
+        finally
+        {
+            ovrConfig.handTrackingSupport = originalHandTrackingSupport;
+            ovrConfig.handTrackingFrequency = originalHandTrackingFrequency;
+            EditorUtility.SetDirty(ovrConfig);
+            AssetDatabase.SaveAssets();
+        }
 
         if (summary.result != BuildResult.Succeeded)
         {
             throw new Exception($"Quest Android build failed: {summary.result}");
         }
+    }
+
+    private static OVRProjectConfig.HandTrackingSupport ResolveHandTrackingSupport()
+    {
+        var value = Environment.GetEnvironmentVariable("QUEST_HAND_TRACKING_SUPPORT");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return OVRProjectConfig.HandTrackingSupport.HandsOnly;
+        }
+
+        if (Enum.TryParse(value, true, out OVRProjectConfig.HandTrackingSupport parsed))
+        {
+            return parsed;
+        }
+
+        throw new ArgumentException(
+            "QUEST_HAND_TRACKING_SUPPORT must be ControllersOnly, ControllersAndHands, or HandsOnly.");
     }
 }

@@ -15,6 +15,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         [Header("Controls configuration")]
         [SerializeField] private OVRInput.RawButton m_actionButton = OVRInput.RawButton.A;
+        [SerializeField] private bool m_autoStartQuestLocalDetection = true;
 
         [Header("Ui references")]
         [SerializeField] private DetectionUiMenuManager m_uiMenuManager;
@@ -80,6 +81,10 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 if (hasWebCamTextureData && m_isSentisReady)
                 {
                     m_uiMenuManager.OnInitialMenu(m_environmentRaycast.HasScenePermission());
+                    if (m_autoStartQuestLocalDetection && m_runInference != null && m_runInference.IsQuestLocalOnly)
+                    {
+                        OnPause(false);
+                    }
                     m_isStarted = true;
                 }
             }

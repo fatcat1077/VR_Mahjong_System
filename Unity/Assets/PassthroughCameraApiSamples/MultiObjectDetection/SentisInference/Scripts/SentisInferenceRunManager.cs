@@ -17,6 +17,12 @@ namespace PassthroughCameraSamples.MultiObjectDetection
     [MetaCodeSample("PassthroughCameraApiSamples-MultiObjectDetection")]
     public class SentisInferenceRunManager : MonoBehaviour
     {
+        private const int QuestFinalSegInputSize = 640;
+        private const int QuestFinalClassifierInputSize = 128;
+        private const string QuestFinalSegmentationModel = "BenchmarkModels/quest_best_v8n_seg_640";
+        private const string QuestFinalClassifierModel = "BenchmarkModels/quest_best_classification_128";
+        private const string QuestFinalPpoModel = "BenchmarkModels/quest_masked_cont100m_to150m_policy_logits";
+
         // =========================================================
         // ✅ Stream-only mode (Quest -> PC save jpg)
         // =========================================================
@@ -46,6 +52,21 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         [Header("Mahjong Scene Reset")]
         [SerializeField] private OVRInput.RawButton m_resetSceneButton = OVRInput.RawButton.X;
+
+        [Header("Quest Local Inference")]
+        [SerializeField] private bool m_questLocalOnly = true;
+        [SerializeField] private int m_localFps = 3;
+        [SerializeField] private BackendType m_localBackend = BackendType.GPUCompute;
+        [SerializeField] private int m_localSegInputSize = 640;
+        [SerializeField] private int m_localClassifierInputSize = 128;
+        [SerializeField, Range(0, 1)] private float m_localDetScoreThreshold = 0.25f;
+        [SerializeField, Range(0, 1)] private float m_localDetIouThreshold = 0.45f;
+        [SerializeField, Range(0, 1)] private float m_localClassifierConfThreshold = 0.35f;
+        [SerializeField] private int m_localHandStableFrames = 7;
+        [SerializeField] private int m_localTableStableFrames = 4;
+        [SerializeField] private string m_localSegmentationModel = "BenchmarkModels/quest_best_v8n_seg_640";
+        [SerializeField] private string m_localClassifierModel = "BenchmarkModels/quest_best_classification_128";
+        [SerializeField] private string m_localPpoModel = "BenchmarkModels/quest_masked_cont100m_to150m_policy_logits";
 
         // Networking
         private TcpClient _client;
@@ -78,6 +99,10 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         private int _recvFailures;
         private int _lastSentBytes;
         private int _sceneResetRequests;
+        private int _localFramesProcessed;
+        private int _localFailures;
+        private float _nextLocalInferenceTime;
+        private QuestLocalMahjongPipeline _localPipeline;
 
         // =========================================================
         // ✅ Original Sentis fields (保留，避免 Editor/其他腳本報錯)
@@ -114,6 +139,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         private Tensor<int> m_pullLabelIDs;
         private bool m_isWaiting = false;
 
+        public bool IsQuestLocalOnly { get { return m_questLocalOnly; } }
+
         #region Unity Functions
         private IEnumerator Start()
         {
@@ -126,7 +153,11 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             if (m_uiInference != null)
                 m_uiInference.SetLabels(m_labelsAsset);
 
-            if (m_streamOnly)
+            if (m_questLocalOnly)
+            {
+                LoadQuestLocalPipeline();
+            }
+            else if (m_streamOnly)
             {
                 NormalizeStreamSettings();
                 // Stream only：不載 Sentis
@@ -141,7 +172,11 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         private void Update()
         {
-            if (m_streamOnly)
+            if (m_questLocalOnly)
+            {
+                QuestLocalUpdate();
+            }
+            else if (m_streamOnly)
             {
                 StreamUpdate();
             }
@@ -158,6 +193,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             {
                 StopCoroutine(m_schedule);
             }
+            _localPipeline?.Dispose();
+            _localPipeline = null;
             m_input?.Dispose();
             m_engine?.Dispose();
 
@@ -186,6 +223,12 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             if (m_uiInference != null)
                 m_uiInference.SetDetectionCapture(targetTexture);
 
+            if (m_questLocalOnly)
+            {
+                _latestTexture = targetTexture;
+                return;
+            }
+
             if (m_streamOnly)
             {
                 // Stream：只記住最新 texture，真正送幀由 Update 控制固定 FPS
@@ -207,9 +250,106 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         public bool IsRunning()
         {
             // 這個方法一定要留，DetectionManager 會用
-            return m_started;
+            return m_questLocalOnly ? false : m_started;
         }
         #endregion
+
+        // =========================================================
+        // Quest-local implementation
+        // =========================================================
+        private void LoadQuestLocalPipeline()
+        {
+            ApplyQuestFinalModelSettings();
+            Debug.Log(
+                $"[QuestLocal] Loading models seg={m_localSegmentationModel} cls={m_localClassifierModel} ppo={m_localPpoModel} backend={m_localBackend}");
+            _localPipeline?.Dispose();
+            _localPipeline = new QuestLocalMahjongPipeline(
+                m_localBackend,
+                m_localSegInputSize,
+                m_localClassifierInputSize,
+                m_localDetScoreThreshold,
+                m_localDetIouThreshold,
+                m_localClassifierConfThreshold,
+                m_localHandStableFrames,
+                m_localTableStableFrames);
+
+            IsModelLoaded = _localPipeline.Load(
+                m_localSegmentationModel,
+                m_localClassifierModel,
+                m_localPpoModel);
+
+            if (IsModelLoaded)
+            {
+                Debug.Log("[QuestLocal] Ready");
+                m_menuUi?.SetConnectionState(true, "Quest local", null);
+                m_uiInference?.SetConnectionState(true);
+            }
+            else
+            {
+                Debug.LogError("[QuestLocal] Not ready: " + _localPipeline.LastError);
+                m_menuUi?.SetConnectionState(false, "Quest local load failed", _localPipeline.LastError);
+                m_uiInference?.SetConnectionState(false);
+            }
+        }
+
+        private void ApplyQuestFinalModelSettings()
+        {
+            m_localSegInputSize = QuestFinalSegInputSize;
+            m_localClassifierInputSize = QuestFinalClassifierInputSize;
+            m_localSegmentationModel = QuestFinalSegmentationModel;
+            m_localClassifierModel = QuestFinalClassifierModel;
+            m_localPpoModel = QuestFinalPpoModel;
+        }
+
+        private void QuestLocalUpdate()
+        {
+            if (OVRInput.GetUp(m_resetSceneButton) || Input.GetKeyUp(KeyCode.X))
+            {
+                _localPipeline?.ResetScene();
+                Interlocked.Increment(ref _sceneResetRequests);
+                Debug.Log("[QuestLocal] Scene reset requested");
+            }
+
+            if (_localPipeline == null || !IsModelLoaded || _latestTexture == null)
+                return;
+
+            if (Time.unscaledTime < _nextLocalInferenceTime)
+                return;
+
+            _nextLocalInferenceTime = Time.unscaledTime + (1f / Mathf.Max(1, m_localFps));
+
+            try
+            {
+                var result = _localPipeline.Run(_latestTexture);
+                Interlocked.Increment(ref _localFramesProcessed);
+
+                if (m_menuUi != null)
+                {
+                    m_menuUi.SetPcLog(result.PcLog);
+                    m_menuUi.SetStreamDebug(
+                        "[QUEST] local=running fpsTarget=" + m_localFps +
+                        " frames=" + _localFramesProcessed +
+                        " reset=" + _sceneResetRequests +
+                        " errors=" + _localFailures);
+                }
+
+                if (m_uiInference != null)
+                {
+                    m_uiInference.DrawRemoteBoxes(
+                        result.Tiles,
+                        _latestTexture.width,
+                        _latestTexture.height,
+                        result.Hand);
+                    m_uiInference.SetAdvice(result.Advice);
+                }
+            }
+            catch (Exception e)
+            {
+                Interlocked.Increment(ref _localFailures);
+                Debug.LogWarning("[QuestLocal] Update failed: " + e.Message);
+                m_menuUi?.SetPcLog("Mode: Quest local\nError: " + e.Message);
+            }
+        }
 
         // =========================================================
         // ✅ Stream-only implementation

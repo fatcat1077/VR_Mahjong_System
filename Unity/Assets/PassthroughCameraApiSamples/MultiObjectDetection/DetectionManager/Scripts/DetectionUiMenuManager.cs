@@ -305,6 +305,12 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         private string BuildPromptDisplayText(string rawText)
         {
+            if (!string.IsNullOrEmpty(rawText) &&
+                (rawText.Contains("Mode: Quest local") || rawText.Contains("Hand:") || rawText.Contains("Action:")))
+            {
+                return rawText.TrimEnd();
+            }
+
             var hand = ExtractLineValue(rawText, "手牌");
             var table = ExtractLineValue(rawText, "桌上牌");
             var action = ExtractLineValue(rawText, "建議動作");
