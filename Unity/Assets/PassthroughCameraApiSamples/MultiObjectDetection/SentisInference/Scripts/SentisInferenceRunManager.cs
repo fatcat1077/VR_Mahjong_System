@@ -44,6 +44,9 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         [SerializeField] private bool m_showStreamDebug = true;
         [SerializeField] private float m_debugUiIntervalSec = 0.5f;
 
+        [Header("Camera Source")]
+        [SerializeField] private WebCamTextureManager m_webCamTextureManager;
+
         [Header("Mahjong Scene Reset")]
         [SerializeField] private OVRInput.RawButton m_resetSceneButton = OVRInput.RawButton.X;
 
@@ -122,6 +125,9 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             if (m_menuUi == null)
                 m_menuUi = FindFirstObjectByType<DetectionUiMenuManager>();
+
+            if (m_webCamTextureManager == null)
+                m_webCamTextureManager = FindFirstObjectByType<WebCamTextureManager>();
 
             if (m_uiInference != null)
                 m_uiInference.SetLabels(m_labelsAsset);
@@ -230,6 +236,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         private void StreamUpdate()
         {
             HandleSceneResetInput();
+            RefreshLatestStreamTexture();
 
             // auto reconnect
             if (!_connected && m_autoReconnect && Time.unscaledTime >= _nextReconnectTime)
@@ -249,6 +256,27 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             ProcessRecvQueue();
 
             UpdateLocalStreamDebug();
+        }
+
+        private void RefreshLatestStreamTexture()
+        {
+            if (m_webCamTextureManager == null)
+            {
+                m_webCamTextureManager = FindFirstObjectByType<WebCamTextureManager>();
+            }
+
+            var texture = m_webCamTextureManager != null ? m_webCamTextureManager.WebCamTexture : null;
+            if (texture == null || texture.width <= 16 || texture.height <= 16)
+            {
+                return;
+            }
+
+            _latestTexture = texture;
+
+            if (m_uiInference != null)
+            {
+                m_uiInference.SetDetectionCapture(texture);
+            }
         }
 
         private void Connect()

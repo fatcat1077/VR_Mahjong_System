@@ -41,6 +41,12 @@ public static class QuestAppBuild
         PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel32;
         PlayerSettings.Android.targetSdkVersion = AndroidSdkVersions.AndroidApiLevel32;
 
+        var ovrConfig = OVRProjectConfig.CachedProjectConfig;
+        ovrConfig.handTrackingSupport = OVRProjectConfig.HandTrackingSupport.ControllersAndHands;
+        ovrConfig.handTrackingFrequency = OVRProjectConfig.HandTrackingFrequency.LOW;
+        EditorUtility.SetDirty(ovrConfig);
+        AssetDatabase.SaveAssets();
+
         var options = new BuildPlayerOptions
         {
             scenes = scenes,
