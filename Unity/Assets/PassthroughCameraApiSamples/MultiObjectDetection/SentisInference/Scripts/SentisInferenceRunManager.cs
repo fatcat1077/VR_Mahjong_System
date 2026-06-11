@@ -330,7 +330,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                         "[QUEST] local=running fpsTarget=" + m_localFps +
                         " frames=" + _localFramesProcessed +
                         " reset=" + _sceneResetRequests +
-                        " errors=" + _localFailures);
+                        " errors=" + _localFailures +
+                        " logRows=" + (_localPipeline?.LatencySampleCount ?? 0));
                 }
 
                 if (m_uiInference != null)

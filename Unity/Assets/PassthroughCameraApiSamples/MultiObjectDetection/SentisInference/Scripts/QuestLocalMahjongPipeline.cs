@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
 using Unity.Sentis;
@@ -19,6 +21,11 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         private const int PhaseDiscard = 0;
         private const int PhaseClaim = 1;
+        private const int TurnCorrectionCooldownFrames = 15;
+        private const float TableMatchDist = 0.12f;
+        private const int LatencyLogFlushRows = 5;
+        private const string LatencyLogFolderName = "MahjongLatencyLogs";
+        private static readonly char[] CsvSpecialChars = { ',', '"', '\n', '\r' };
 
         private static readonly string[] TileLabels =
         {
@@ -66,24 +73,39 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         private List<TableObs> _tableCandidateObs = new List<TableObs>();
         private string _stableTableSignature = "";
         private List<TableObs> _stableTableObs = new List<TableObs>();
+        private bool _hasStableTable;
 
         private readonly List<int>[] _discards =
         {
             new List<int>(), new List<int>(), new List<int>(), new List<int>()
         };
 
+        private int _frameIndex;
+        private int _cooldownFramesRemaining;
         private int _currentPlayer;
         private int _phase = PhaseDiscard;
         private int _expectedDiscarder;
         private int _lastDiscard = -1;
         private int _lastDiscarder = -1;
         private int _pendingSelfTableTile = -1;
+        private bool _selfDiscardTurnActive;
+        private bool _resetTableBaselineOnNextStable;
+        private int _stableHandCount = -1;
+        private string _lastFlowEvent = "";
 
         private bool _loaded;
         private string _lastError = "";
+        private bool _latencyLogEnabled;
+        private string _latencyLogPath = "";
+        private readonly StringBuilder _latencyLogBuffer = new StringBuilder(8192);
+        private int _latencyRowsBuffered;
+        private int _latencySamples;
+        private bool _latencyLogErrorReported;
 
         public bool IsLoaded { get { return _loaded; } }
         public string LastError { get { return _lastError; } }
+        public string LatencyLogPath { get { return _latencyLogPath; } }
+        public int LatencySampleCount { get { return _latencySamples; } }
 
         public QuestLocalMahjongPipeline(
             BackendType backend,
@@ -131,6 +153,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 _ppoWorker = new Worker(ModelLoader.Load(ppoAsset), _backend);
                 _loaded = true;
                 _lastError = "";
+                InitializeLatencyLog();
                 Debug.Log("[QuestLocal] Models loaded");
                 return true;
             }
@@ -138,6 +161,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             {
                 _lastError = e.Message;
                 _loaded = false;
+                _latencyLogEnabled = false;
                 Debug.LogError("[QuestLocal] Load failed: " + e);
                 return false;
             }
@@ -145,6 +169,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         public void ResetScene()
         {
+            FlushLatencyLog();
             _tracks.Clear();
             _nextTrackId = 0;
             _recentHandSignatures.Clear();
@@ -158,14 +183,21 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             _tableCandidateObs.Clear();
             _stableTableSignature = "";
             _stableTableObs.Clear();
+            _hasStableTable = false;
             foreach (var pile in _discards)
                 pile.Clear();
+            _frameIndex = 0;
+            _cooldownFramesRemaining = 0;
             _currentPlayer = 0;
             _phase = PhaseDiscard;
             _expectedDiscarder = 0;
             _lastDiscard = -1;
             _lastDiscarder = -1;
             _pendingSelfTableTile = -1;
+            _selfDiscardTurnActive = false;
+            _resetTableBaselineOnNextStable = false;
+            _stableHandCount = -1;
+            _lastFlowEvent = "scene_reset";
         }
 
         public LocalResult Run(Texture source)
@@ -191,6 +223,10 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             var start = Time.realtimeSinceStartup;
             try
             {
+                _frameIndex++;
+                if (_cooldownFramesRemaining > 0)
+                    _cooldownFramesRemaining--;
+
                 var frameStart = Time.realtimeSinceStartup;
                 EnsureFrameTexture(source);
                 var frameMs = (Time.realtimeSinceStartup - frameStart) * 1000f;
@@ -262,23 +298,23 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 if (selfDiscard >= 0)
                     CompleteSelfDiscard(selfDiscard);
 
-                UpdateHandStability(handTiles, handLabels);
+                var handStable = UpdateHandStability(handTiles, handLabels);
                 UpdateTableStability(tableObs);
 
-                if (IsStableSelfTurn(handTiles))
+                if (handStable && IsStableSelfTurn(handTiles) && !_selfDiscardTurnActive)
                     CorrectToSelfTurn(handTiles, handLabels);
 
                 var effectiveHandTiles = _stableHandActive ? new List<int>(_stableHandTiles) : handTiles;
                 var effectiveHandLabels = _stableHandActive ? new List<string>(_stableHandLabels) : handLabels;
 
                 var ppoStart = Time.realtimeSinceStartup;
-                var advice = BuildAdvice(effectiveHandTiles);
+                var advice = BuildAdvice(effectiveHandTiles, handStable);
                 var ppoMs = (Time.realtimeSinceStartup - ppoStart) * 1000f;
                 if (_phase == PhaseDiscard && _currentPlayer == 0 && advice.benefit != null)
                     _stableRecommendedDiscard = advice.benefit.tile_id;
 
                 var action = advice.benefit != null ? advice.benefit.tile : "";
-                var stable = _stableHandActive || _stableTableObs.Count > 0;
+                var stable = _stableHandActive || _hasStableTable;
                 var elapsedMs = (Time.realtimeSinceStartup - start) * 1000f;
                 var latency = new LatencyInfo
                 {
@@ -289,6 +325,16 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                     PpoMs = ppoMs,
                     TotalMs = elapsedMs
                 };
+                RecordLatencySample(
+                    latency,
+                    detections.Count,
+                    classified.Count,
+                    tracked.Count,
+                    handTiles.Count,
+                    tableObs.Count,
+                    _stableTableObs.Count,
+                    stable,
+                    action);
                 result.Tiles = remoteTiles.ToArray();
                 result.Hand = effectiveHandLabels.ToArray();
                 result.Advice = advice;
@@ -317,6 +363,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         public void Dispose()
         {
+            FlushLatencyLog();
             _segWorker?.Dispose();
             _clsWorker?.Dispose();
             _ppoWorker?.Dispose();
@@ -498,7 +545,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             return new List<TrackState>(_tracks);
         }
 
-        private void UpdateHandStability(List<int> handTiles, List<string> handLabels)
+        private bool UpdateHandStability(List<int> handTiles, List<string> handLabels)
         {
             var sig = Signature(handTiles);
             _recentHandSignatures.Enqueue(sig);
@@ -506,21 +553,27 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 _recentHandSignatures.Dequeue();
 
             if (_recentHandSignatures.Count < _handStableFrames)
-                return;
+                return false;
 
             foreach (var item in _recentHandSignatures)
             {
                 if (item != sig)
-                    return;
+                    return false;
             }
 
             _stableHandSignature = sig;
+            _stableHandCount = handTiles.Count;
             if (IsSelfTurnCount(handTiles.Count))
             {
                 _stableHandActive = true;
                 _stableHandTiles = new List<int>(handTiles);
                 _stableHandLabels = new List<string>(handLabels);
             }
+            else
+            {
+                _selfDiscardTurnActive = false;
+            }
+            return true;
         }
 
         private int TryCompleteSelfDiscard(List<int> liveHandTiles)
@@ -539,6 +592,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             _stableHandTiles.Clear();
             _stableHandLabels.Clear();
             _stableRecommendedDiscard = -1;
+            _stableHandCount = -1;
+            _lastFlowEvent = "stable_hand_self_discard_detected";
             return discarded;
         }
 
@@ -552,7 +607,10 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             _expectedDiscarder = 1;
             _currentPlayer = 1;
             _phase = PhaseDiscard;
+            _selfDiscardTurnActive = false;
             _pendingSelfTableTile = tileId;
+            _resetTableBaselineOnNextStable = false;
+            _lastFlowEvent = "self_discard_left_hand:" + TileIdToLabel(tileId);
         }
 
         private void UpdateTableStability(List<TableObs> tableObs)
@@ -574,35 +632,102 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 return;
 
             var cur = new List<TableObs>(_tableCandidateObs);
-            if (string.IsNullOrEmpty(_stableTableSignature))
+            if (_resetTableBaselineOnNextStable)
             {
-                _stableTableSignature = sig;
-                _stableTableObs = cur;
-                if (_pendingSelfTableTile >= 0)
-                    _pendingSelfTableTile = -1;
+                SetStableTable(sig, cur);
+                _resetTableBaselineOnNextStable = false;
+                _lastFlowEvent = "table_baseline_reset";
                 return;
             }
 
-            if (sig == _stableTableSignature)
+            if (_hasStableTable && sig == _stableTableSignature)
                 return;
 
-            if (cur.Count == _stableTableObs.Count + 1)
+            if (_pendingSelfTableTile >= 0)
             {
-                var newTile = FindNewTableTile(_stableTableObs, cur);
-                if (newTile.TileId >= 0)
+                if (!_hasStableTable)
                 {
-                    if (_pendingSelfTableTile >= 0)
+                    SetStableTable(sig, cur);
+                    _lastFlowEvent = "table_self_discard_baseline:" + TileIdToLabel(_pendingSelfTableTile);
+                    _pendingSelfTableTile = -1;
+                    return;
+                }
+
+                if (cur.Count == _stableTableObs.Count + 1)
+                {
+                    var newTiles = FindNewTableObservations(_stableTableObs, cur);
+                    if (newTiles.Count > 0)
                     {
+                        SetStableTable(sig, cur);
+                        _lastFlowEvent = "table_self_discard_baseline:" + TileIdToLabel(_pendingSelfTableTile);
                         _pendingSelfTableTile = -1;
                     }
                     else
                     {
-                        AcceptNewDiscard(newTile);
+                        _lastFlowEvent = "table_new_tile_unmatched";
                     }
-                    _stableTableSignature = sig;
-                    _stableTableObs = cur;
+                }
+                else if (cur.Count == _stableTableObs.Count)
+                {
+                    _lastFlowEvent = "table_waiting_self_discard_baseline";
+                }
+                else if (cur.Count > _stableTableObs.Count + 1)
+                {
+                    _lastFlowEvent = "table_count_jump_ignored";
+                }
+                else
+                {
+                    _lastFlowEvent = "table_count_drop_ignored";
+                }
+                return;
+            }
+
+            if (!_hasStableTable)
+            {
+                SetStableTable(sig, cur);
+                _lastFlowEvent = "table_baseline_stable";
+                return;
+            }
+
+            if (cur.Count == _stableTableObs.Count + 1)
+            {
+                var newTiles = FindNewTableObservations(_stableTableObs, cur);
+                if (newTiles.Count > 0)
+                {
+                    if (_expectedDiscarder == 0 && _selfDiscardTurnActive)
+                    {
+                        _lastFlowEvent = "table_waiting_self_discard_hand_exit";
+                    }
+                    else
+                    {
+                        AcceptNewDiscard(newTiles[0]);
+                        SetStableTable(sig, cur);
+                    }
+                }
+                else
+                {
+                    _lastFlowEvent = "table_new_tile_unmatched";
                 }
             }
+            else if (cur.Count == _stableTableObs.Count)
+            {
+                _lastFlowEvent = "table_same_count_stable";
+            }
+            else if (cur.Count > _stableTableObs.Count + 1)
+            {
+                _lastFlowEvent = "table_count_jump_ignored";
+            }
+            else
+            {
+                _lastFlowEvent = "table_count_drop_ignored";
+            }
+        }
+
+        private void SetStableTable(string signature, List<TableObs> obs)
+        {
+            _stableTableSignature = signature;
+            _stableTableObs = new List<TableObs>(obs);
+            _hasStableTable = true;
         }
 
         private void AcceptNewDiscard(TableObs obs)
@@ -613,7 +738,16 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             _lastDiscarder = discarder;
             _expectedDiscarder = (discarder + 1) % 4;
             _currentPlayer = _expectedDiscarder;
-            _phase = discarder == 0 ? PhaseDiscard : PhaseClaim;
+            if (discarder == 0)
+            {
+                _phase = PhaseDiscard;
+                _selfDiscardTurnActive = false;
+            }
+            else
+            {
+                _phase = PhaseClaim;
+            }
+            _lastFlowEvent = "table_discard:" + TurnLabel(discarder) + ":" + TileIdToLabel(obs.TileId);
         }
 
         private void CorrectToSelfTurn(List<int> handTiles, List<string> handLabels)
@@ -621,9 +755,14 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             _currentPlayer = 0;
             _phase = PhaseDiscard;
             _expectedDiscarder = 0;
+            _selfDiscardTurnActive = true;
+            _resetTableBaselineOnNextStable = true;
+            _cooldownFramesRemaining = TurnCorrectionCooldownFrames;
             _stableHandActive = true;
             _stableHandTiles = new List<int>(handTiles);
             _stableHandLabels = new List<string>(handLabels);
+            _stableHandCount = handTiles.Count;
+            _lastFlowEvent = "stable_hand_promoted_to_self_turn";
         }
 
         private bool IsStableSelfTurn(List<int> handTiles)
@@ -634,8 +773,13 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             return _stableHandSignature == sig;
         }
 
-        private SentisInferenceUiManager.Advice BuildAdvice(List<int> handTiles)
+        private SentisInferenceUiManager.Advice BuildAdvice(List<int> handTiles, bool handStable)
         {
+            var canDiscard = handStable && _phase == PhaseDiscard && _currentPlayer == 0 && IsSelfTurnCount(handTiles.Count);
+            var canClaim = handStable && _phase == PhaseClaim && _lastDiscarder != 0 && _lastDiscard >= 0;
+            if (!canDiscard && !canClaim)
+                return EmptyAdvice();
+
             var mask = LegalActionMask(handTiles);
             var action = PredictAction(handTiles, mask);
             if (action < 0 || action >= ActionDim || !mask[action])
@@ -790,6 +934,9 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             sb.Append("Turn: ").AppendLine(TurnLabel(_currentPlayer));
             sb.Append("Stable: ").AppendLine(stable ? "yes" : "no");
             sb.Append("Action: ").AppendLine(action);
+            sb.Append("Flow: ").Append(string.IsNullOrEmpty(_lastFlowEvent) ? "none" : _lastFlowEvent)
+                .Append(" exp=").Append(TurnLabel(_expectedDiscarder))
+                .Append(" cd=").AppendLine(_cooldownFramesRemaining.ToString());
             sb.Append("Debug: det=").Append(detectionCount)
                 .Append(" cls=").Append(classifiedCount)
                 .Append(" tracked=").Append(tracked)
@@ -803,6 +950,126 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 .Append(" total=").Append(latency.TotalMs.ToString("0.0"))
                 .Append(" ms");
             return sb.ToString();
+        }
+
+        private void InitializeLatencyLog()
+        {
+            try
+            {
+                var folder = Path.Combine(Application.persistentDataPath, LatencyLogFolderName);
+                Directory.CreateDirectory(folder);
+                var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+                _latencyLogPath = Path.Combine(folder, "quest_latency_" + stamp + ".csv");
+                _latencyLogBuffer.Length = 0;
+                _latencyRowsBuffered = 0;
+                _latencySamples = 0;
+                _latencyLogErrorReported = false;
+                _latencyLogEnabled = true;
+
+                File.WriteAllText(
+                    _latencyLogPath,
+                    "timestamp_utc,frame_index,unity_time_s,detected_count,classified_count,tracked_count,hand_count,table_live_count,table_stable_count,stable_hand,stable_table,stable_any,phase,current_turn,expected_discarder,last_discarder,last_discard,action,flow_event,frame_ms,segmentation_ms,classification_ms,tracking_ms,ppo_ms,total_pipeline_ms\n");
+                Debug.Log("[QuestLocal] Latency log: " + _latencyLogPath);
+            }
+            catch (Exception e)
+            {
+                _latencyLogEnabled = false;
+                _latencyLogPath = "";
+                Debug.LogWarning("[QuestLocal] Latency log disabled: " + e.Message);
+            }
+        }
+
+        private void RecordLatencySample(
+            LatencyInfo latency,
+            int detectionCount,
+            int classifiedCount,
+            int trackedCount,
+            int handCount,
+            int tableLiveCount,
+            int tableStableCount,
+            bool stableAny,
+            string action)
+        {
+            if (!_latencyLogEnabled || string.IsNullOrEmpty(_latencyLogPath))
+                return;
+
+            try
+            {
+                _latencySamples++;
+                _latencyLogBuffer
+                    .Append(Csv(DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture))).Append(',')
+                    .Append(_frameIndex).Append(',')
+                    .Append(Time.realtimeSinceStartup.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(detectionCount).Append(',')
+                    .Append(classifiedCount).Append(',')
+                    .Append(trackedCount).Append(',')
+                    .Append(handCount).Append(',')
+                    .Append(tableLiveCount).Append(',')
+                    .Append(tableStableCount).Append(',')
+                    .Append(_stableHandActive ? "1" : "0").Append(',')
+                    .Append(_hasStableTable ? "1" : "0").Append(',')
+                    .Append(stableAny ? "1" : "0").Append(',')
+                    .Append(_phase == PhaseClaim ? "claim" : "discard").Append(',')
+                    .Append(Csv(TurnLabel(_currentPlayer))).Append(',')
+                    .Append(Csv(TurnLabel(_expectedDiscarder))).Append(',')
+                    .Append(_lastDiscarder).Append(',')
+                    .Append(_lastDiscard).Append(',')
+                    .Append(Csv(action)).Append(',')
+                    .Append(Csv(_lastFlowEvent)).Append(',')
+                    .Append(latency.FrameMs.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(latency.SegMs.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(latency.ClsMs.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(latency.TrackMs.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(latency.PpoMs.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(latency.TotalMs.ToString("0.000", CultureInfo.InvariantCulture))
+                    .AppendLine();
+                _latencyRowsBuffered++;
+
+                if (_latencyRowsBuffered >= LatencyLogFlushRows)
+                    FlushLatencyLog();
+            }
+            catch (Exception e)
+            {
+                DisableLatencyLogAfterError(e);
+            }
+        }
+
+        private void FlushLatencyLog()
+        {
+            if (!_latencyLogEnabled || _latencyRowsBuffered <= 0 || string.IsNullOrEmpty(_latencyLogPath))
+                return;
+
+            try
+            {
+                File.AppendAllText(_latencyLogPath, _latencyLogBuffer.ToString());
+                _latencyLogBuffer.Length = 0;
+                _latencyRowsBuffered = 0;
+            }
+            catch (Exception e)
+            {
+                DisableLatencyLogAfterError(e);
+            }
+        }
+
+        private void DisableLatencyLogAfterError(Exception e)
+        {
+            _latencyLogEnabled = false;
+            _latencyLogBuffer.Length = 0;
+            _latencyRowsBuffered = 0;
+            if (!_latencyLogErrorReported)
+            {
+                _latencyLogErrorReported = true;
+                Debug.LogWarning("[QuestLocal] Latency log write failed: " + e.Message);
+            }
+        }
+
+        private static string Csv(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return "";
+            if (value.IndexOfAny(CsvSpecialChars) < 0)
+                return value;
+            return "\"" + value.Replace("\"", "\"\"") + "\"";
         }
 
         private List<string> StableTableLabels()
@@ -1022,20 +1289,38 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             return counts;
         }
 
-        private static TableObs FindNewTableTile(List<TableObs> previous, List<TableObs> current)
+        private static List<TableObs> FindNewTableObservations(List<TableObs> previous, List<TableObs> current)
         {
             var used = new bool[current.Count];
+
+            foreach (var prev in previous)
+            {
+                if (prev.TrackId < 0)
+                    continue;
+                var matched = -1;
+                for (var i = 0; i < current.Count; i++)
+                {
+                    if (used[i] || current[i].TrackId != prev.TrackId)
+                        continue;
+                    if (ObsDistance(prev, current[i]) <= TableMatchDist)
+                    {
+                        matched = i;
+                        break;
+                    }
+                }
+                if (matched >= 0)
+                    used[matched] = true;
+            }
+
             foreach (var prev in previous)
             {
                 var best = -1;
-                var bestDist = 0.12f;
+                var bestDist = TableMatchDist;
                 for (var i = 0; i < current.Count; i++)
                 {
                     if (used[i] || current[i].TileId != prev.TileId)
                         continue;
-                    var dx = current[i].Cx - prev.Cx;
-                    var dy = current[i].Cy - prev.Cy;
-                    var dist = Mathf.Sqrt(dx * dx + dy * dy);
+                    var dist = ObsDistance(prev, current[i]);
                     if (dist < bestDist)
                     {
                         bestDist = dist;
@@ -1046,12 +1331,28 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                     used[best] = true;
             }
 
+            var newItems = new List<TableObs>();
             for (var i = 0; i < current.Count; i++)
             {
                 if (!used[i])
-                    return current[i];
+                    newItems.Add(current[i]);
             }
-            return new TableObs { TileId = -1 };
+            newItems.Sort((a, b) =>
+            {
+                var c = a.Cx.CompareTo(b.Cx);
+                if (c != 0) return c;
+                c = a.Cy.CompareTo(b.Cy);
+                if (c != 0) return c;
+                return a.TileId.CompareTo(b.TileId);
+            });
+            return newItems;
+        }
+
+        private static float ObsDistance(TableObs a, TableObs b)
+        {
+            var dx = a.Cx - b.Cx;
+            var dy = a.Cy - b.Cy;
+            return Mathf.Sqrt(dx * dx + dy * dy);
         }
 
         public sealed class LocalResult
