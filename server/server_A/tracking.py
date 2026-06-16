@@ -28,17 +28,27 @@ def iou_xyxy(a: Box, b: Box) -> float:
 
 
 class Track:
-    def __init__(self, tid: int, bbox_xyxy: Box, cls_name: str, conf: float, hist_len: int):
+    def __init__(
+        self,
+        tid: int,
+        bbox_xyxy: Box,
+        cls_name: str,
+        conf: float,
+        hist_len: int,
+        area_type: str = "",
+    ):
         self.id = tid
         self.bbox: Box = bbox_xyxy
         self.cls_hist = deque([cls_name], maxlen=hist_len)
         self.conf_hist = deque([conf], maxlen=hist_len)
+        self.area_type_hist = deque([area_type or ""], maxlen=hist_len)
         self.last_seen = time.time()
 
-    def update(self, bbox_xyxy: Box, cls_name: str, conf: float) -> None:
+    def update(self, bbox_xyxy: Box, cls_name: str, conf: float, area_type: str = "") -> None:
         self.bbox = bbox_xyxy
         self.cls_hist.append(cls_name)
         self.conf_hist.append(conf)
+        self.area_type_hist.append(area_type or "")
         self.last_seen = time.time()
 
     def stable_cls(self) -> str:
@@ -47,6 +57,10 @@ class Track:
 
     def stable_conf(self) -> float:
         return float(np.mean(self.conf_hist)) if self.conf_hist else 0.0
+
+    def stable_area_type(self) -> str:
+        c = Counter(self.area_type_hist)
+        return c.most_common(1)[0][0] if c else ""
 
 
 class Tracker:
@@ -63,7 +77,13 @@ class Tracker:
         self._tracks.clear()
         self._next_tid = 0
 
-    def update(self, det_boxes_xyxy: List[Box], cls_names: List[str], cls_confs: List[float]) -> List[Track]:
+    def update(
+        self,
+        det_boxes_xyxy: List[Box],
+        cls_names: List[str],
+        cls_confs: List[float],
+        area_types: List[str] | None = None,
+    ) -> List[Track]:
         used_tracks = set()
         assigned = [-1] * len(det_boxes_xyxy)
         track_items = list(self._tracks.items())
@@ -86,13 +106,16 @@ class Tracker:
         for i, box in enumerate(det_boxes_xyxy):
             name = cls_names[i]
             conf = float(cls_confs[i])
+            area_type = ""
+            if area_types is not None and i < len(area_types):
+                area_type = area_types[i] or ""
             tid = assigned[i]
             if tid == -1:
                 tid = self._next_tid
                 self._next_tid += 1
-                self._tracks[tid] = Track(tid, box, name, conf, self.smooth_len)
+                self._tracks[tid] = Track(tid, box, name, conf, self.smooth_len, area_type)
             else:
-                self._tracks[tid].update(box, name, conf)
+                self._tracks[tid].update(box, name, conf, area_type)
 
         to_del = []
         for tid, tr in self._tracks.items():

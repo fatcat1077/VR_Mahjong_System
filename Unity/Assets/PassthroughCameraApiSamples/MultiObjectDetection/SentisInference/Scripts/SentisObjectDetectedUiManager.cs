@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections;
+using System.Linq;
 using Meta.XR.Samples;
 using UnityEngine;
 using UnityEngine.Assertions;
@@ -56,8 +57,11 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 yield return null;
             }
 
-            // Set the 'requestedResolution' and enable the manager
-            m_webCamTextureManager.RequestedResolution = PassthroughCameraUtils.GetCameraIntrinsics(CameraEye).Resolution;
+            // Set the highest supported passthrough camera resolution and enable the manager.
+            var outputSizes = PassthroughCameraUtils.GetOutputSizes(CameraEye);
+            m_webCamTextureManager.RequestedResolution = outputSizes != null && outputSizes.Count > 0
+                ? outputSizes.OrderBy(static size => size.x * size.y).Last()
+                : PassthroughCameraUtils.GetCameraIntrinsics(CameraEye).Resolution;
             m_webCamTextureManager.enabled = true;
 
             var cameraCanvasRectTransform = m_detectionCanvas.GetComponentInChildren<RectTransform>();

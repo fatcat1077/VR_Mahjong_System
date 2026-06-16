@@ -26,16 +26,29 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         [SerializeField] private string m_serverIp = "127.0.0.1";
         [SerializeField] private int m_serverPort = 5000;
 
-        [Tooltip("你要每秒一張就填 1")]
-        [SerializeField, Range(1, 30)] private int m_sendFps = 1;
+        [Tooltip("Frames per second to stream to PC. Higher resolution needs a little more bandwidth/headroom.")]
+        [SerializeField, Range(1, 30)] private int m_sendFps = 8;
 
-        [SerializeField, Range(10, 100)] private int m_jpegQuality = 85;
+        [SerializeField, Range(10, 100)] private int m_jpegQuality = 92;
 
-        [Tooltip("固定輸出尺寸（會把來源 Blit 到這個大小）")]
-        [SerializeField] private Vector2Int m_streamSize = new(640, 640);
+        [Tooltip("固定輸出尺寸（會把來源 Blit 到這個大小）。Use 4:3 to avoid squashing the camera image.")]
+        [SerializeField] private Vector2Int m_streamSize = new(1280, 960);
+
+        [Tooltip("Keep stream settings at the high-resolution defaults even if an old scene/prefab serialized lower values.")]
+        [SerializeField] private bool m_forceHighResolutionStreamDefaults = true;
 
         [SerializeField] private bool m_autoReconnect = true;
         [SerializeField] private float m_reconnectIntervalSec = 2f;
+
+        [Header("Stream Debug")]
+        [SerializeField] private bool m_showStreamDebug = true;
+        [SerializeField] private float m_debugUiIntervalSec = 0.5f;
+
+        [Header("Camera Source")]
+        [SerializeField] private WebCamTextureManager m_webCamTextureManager;
+
+        [Header("Mahjong Scene Reset")]
+        [SerializeField] private OVRInput.RawButton m_resetSceneButton = OVRInput.RawButton.X;
 
         // Networking
         private TcpClient _client;
@@ -56,6 +69,18 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
         private float _nextSendTime;
         private float _nextReconnectTime;
+        private float _nextDebugUiTime;
+
+        // Debug counters. Keep these independent from the stream protocol.
+        private int _connectAttempts;
+        private int _framesQueued;
+        private int _framesSent;
+        private int _responsesReceived;
+        private int _jsonParseErrors;
+        private int _sendFailures;
+        private int _recvFailures;
+        private int _lastSentBytes;
+        private int _sceneResetRequests;
 
         // =========================================================
         // ✅ Original Sentis fields (保留，避免 Editor/其他腳本報錯)
@@ -101,11 +126,15 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             if (m_menuUi == null)
                 m_menuUi = FindFirstObjectByType<DetectionUiMenuManager>();
 
+            if (m_webCamTextureManager == null)
+                m_webCamTextureManager = FindFirstObjectByType<WebCamTextureManager>();
+
             if (m_uiInference != null)
                 m_uiInference.SetLabels(m_labelsAsset);
 
             if (m_streamOnly)
             {
+                NormalizeStreamSettings();
                 // Stream only：不載 Sentis
                 IsModelLoaded = true;
                 Connect();
@@ -191,8 +220,24 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         // =========================================================
         // ✅ Stream-only implementation
         // =========================================================
+        private void NormalizeStreamSettings()
+        {
+            if (!m_forceHighResolutionStreamDefaults)
+                return;
+
+            if (m_streamSize.x < 1280 || m_streamSize.y < 960)
+            {
+                m_streamSize = new Vector2Int(1280, 960);
+            }
+            m_jpegQuality = Mathf.Max(m_jpegQuality, 92);
+            m_sendFps = Mathf.Clamp(m_sendFps, 1, 8);
+        }
+
         private void StreamUpdate()
         {
+            HandleSceneResetInput();
+            RefreshLatestStreamTexture();
+
             // auto reconnect
             if (!_connected && m_autoReconnect && Time.unscaledTime >= _nextReconnectTime)
             {
@@ -209,6 +254,29 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             // receive & update UI (main thread)
             ProcessRecvQueue();
+
+            UpdateLocalStreamDebug();
+        }
+
+        private void RefreshLatestStreamTexture()
+        {
+            if (m_webCamTextureManager == null)
+            {
+                m_webCamTextureManager = FindFirstObjectByType<WebCamTextureManager>();
+            }
+
+            var texture = m_webCamTextureManager != null ? m_webCamTextureManager.WebCamTexture : null;
+            if (texture == null || texture.width <= 16 || texture.height <= 16)
+            {
+                return;
+            }
+
+            _latestTexture = texture;
+
+            if (m_uiInference != null)
+            {
+                m_uiInference.SetDetectionCapture(texture);
+            }
         }
 
         private void Connect()
@@ -217,6 +285,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             try
             {
+                Interlocked.Increment(ref _connectAttempts);
                 _client = new TcpClient();
                 _client.NoDelay = true;
                 _client.Connect(m_serverIp, m_serverPort);
@@ -262,6 +331,41 @@ namespace PassthroughCameraSamples.MultiObjectDetection
 
             _pendingJpeg = null;
             _captureInFlight = false;
+        }
+
+        private void HandleSceneResetInput()
+        {
+            if (OVRInput.GetUp(m_resetSceneButton) || Input.GetKeyUp(KeyCode.X))
+            {
+                SendSceneResetControl();
+            }
+        }
+
+        [Serializable]
+        private class SceneResetControl
+        {
+            public string type = "control";
+            public string command = "scene_reset";
+        }
+
+        private void SendSceneResetControl()
+        {
+            if (_stream == null || !_connected)
+                return;
+
+            try
+            {
+                var msg = new SceneResetControl();
+                var payload = Encoding.UTF8.GetBytes(JsonUtility.ToJson(msg));
+                WriteLengthPrefixed(payload);
+                Interlocked.Increment(ref _sceneResetRequests);
+                Debug.Log("[Stream] Scene reset requested");
+            }
+            catch (Exception e)
+            {
+                Interlocked.Increment(ref _sendFailures);
+                Debug.LogWarning($"[Stream] Scene reset control failed: {e.Message}");
+            }
         }
 
         private void EnsureBuffers()
@@ -318,6 +422,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 _cpuTex.LoadRawTextureData(data);
                 _cpuTex.Apply(false);
                 _pendingJpeg = ImageConversion.EncodeToJPG(_cpuTex, m_jpegQuality);
+                Interlocked.Increment(ref _framesQueued);
             }
             catch { }
         }
@@ -333,6 +438,34 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             RenderTexture.active = prev;
 
             _pendingJpeg = ImageConversion.EncodeToJPG(_cpuTex, m_jpegQuality);
+            Interlocked.Increment(ref _framesQueued);
+        }
+
+        private void WriteLengthPrefixed(byte[] payload)
+        {
+            if (payload == null || _stream == null)
+                return;
+
+            int len = payload.Length;
+
+            byte[] header = new byte[4];
+            header[0] = (byte)((len >> 24) & 0xFF);
+            header[1] = (byte)((len >> 16) & 0xFF);
+            header[2] = (byte)((len >> 8) & 0xFF);
+            header[3] = (byte)(len & 0xFF);
+
+            byte[] packet = new byte[4 + len];
+            Buffer.BlockCopy(header, 0, packet, 0, 4);
+            Buffer.BlockCopy(payload, 0, packet, 4, len);
+
+            lock (_sendLock)
+            {
+                if (_stream == null)
+                    return;
+
+                _stream.Write(packet, 0, packet.Length);
+                _stream.Flush();
+            }
         }
 
         private void SendLoop()
@@ -351,26 +484,16 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                     _pendingJpeg = null;
 
                     int len = jpg.Length;
+                    WriteLengthPrefixed(jpg);
 
-                    // 4-byte big-endian length prefix
-                    byte[] header = new byte[4];
-                    header[0] = (byte)((len >> 24) & 0xFF);
-                    header[1] = (byte)((len >> 16) & 0xFF);
-                    header[2] = (byte)((len >> 8) & 0xFF);
-                    header[3] = (byte)(len & 0xFF);
-
-                    lock (_sendLock)
-                    {
-                        _stream.Write(header, 0, 4);
-                        _stream.Write(jpg, 0, jpg.Length);
-                        _stream.Flush();
-                    }
-
+                    Interlocked.Increment(ref _framesSent);
+                    Interlocked.Exchange(ref _lastSentBytes, len);
                     Debug.Log($"[Stream] Sent frame: {len / 1024f:0.0} KB");
                 }
             }
             catch (Exception e)
             {
+                Interlocked.Increment(ref _sendFailures);
                 Debug.LogWarning($"[Stream] SendLoop stopped: {e.Message}");
                 m_menuUi?.SetConnectionState(false, "SendLoop stopped", e.Message);
             }
@@ -390,6 +513,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             public int img_h;
             public SentisInferenceUiManager.RemoteTile[] tiles;
             public string[] hand;
+            public bool hand_stable;
             public SentisInferenceUiManager.Advice advice;
             public string pc_log;
         }
@@ -450,6 +574,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             }
             catch (Exception e)
             {
+                Interlocked.Increment(ref _recvFailures);
                 Debug.LogWarning($"[Stream] RecvLoop stopped: {e.Message}");
                 m_menuUi?.SetConnectionState(false, "RecvLoop stopped", e.Message);
             }
@@ -470,6 +595,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             {
                 var resp = JsonUtility.FromJson<ServerResponse>(latest);
                 if (resp == null) return;
+                Interlocked.Increment(ref _responsesReceived);
 
                 // Update prompt panel (preferred)
                 if (m_menuUi != null)
@@ -491,8 +617,27 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             }
             catch (Exception e)
             {
+                Interlocked.Increment(ref _jsonParseErrors);
                 Debug.LogWarning($"[Stream] JSON parse failed: {e.Message}");
             }
+        }
+
+        private void UpdateLocalStreamDebug()
+        {
+            if (!m_showStreamDebug || m_menuUi == null) return;
+            if (Time.unscaledTime < _nextDebugUiTime) return;
+            _nextDebugUiTime = Time.unscaledTime + Mathf.Max(0.1f, m_debugUiIntervalSec);
+
+            string pending = _pendingJpeg != null ? "yes" : "no";
+            string capture = _captureInFlight ? "yes" : "no";
+            string debug =
+                $"[QUEST] stream={(_connected ? "connected" : "disconnected")} " +
+                $"targetFps={m_sendFps} size={m_streamSize.x}x{m_streamSize.y} q={m_jpegQuality} " +
+                $"queued={_framesQueued} sent={_framesSent} recv={_responsesReceived} " +
+                $"sceneReset={_sceneResetRequests} " +
+                $"pending={pending} capture={capture} lastKB={_lastSentBytes / 1024f:0.0} " +
+                $"connects={_connectAttempts} sendErr={_sendFailures} recvErr={_recvFailures} jsonErr={_jsonParseErrors}";
+            m_menuUi.SetStreamDebug(debug);
         }
 
         // =========================================================

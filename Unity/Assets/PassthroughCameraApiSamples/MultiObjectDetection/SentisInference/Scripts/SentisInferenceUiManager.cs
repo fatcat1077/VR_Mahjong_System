@@ -372,7 +372,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                     ClassName = classname,
                     Width = width,
                     Height = height,
-                    Label = $"{classname} {t.conf:0.00}",
+                    Label = classname,
                     WorldPos = worldPos,
                 };
 
