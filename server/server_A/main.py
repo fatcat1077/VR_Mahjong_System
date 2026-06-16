@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 import signal
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -12,6 +13,14 @@ from netio import recv_packet, safe_close_conn, send_packet
 from tracking import Tracker
 from vision import VisionPipeline, decode_jpg
 import mahjong
+
+
+DEFAULT_MODEL_ROOT = Path(r"D:\Download\final_models\final_models")
+DEFAULT_YOLO_NAME = "best_segmentation.pt"
+DEFAULT_CLS_NAME = "best_classification.pt"
+DEFAULT_PPO_NAME = "masked_cont100m_to150m_seed42_plus25m.zip"
+DEFAULT_SERVER_MODE = "labeling"
+VALID_SERVER_MODES = {"segmentation_only", "labeling", "full_mahjong"}
 
 
 # ============================================================
@@ -34,7 +43,7 @@ class InferServer:
     def __init__(
         self,
         yolo_path: str,
-        cls_path: str,
+        cls_path: Optional[str],
         host: str,
         port: int,
         det_imgsz: int,
@@ -55,18 +64,36 @@ class InferServer:
         client_idle_timeout: float = 5.0,
         debug_vision_dir: Optional[str] = None,
         debug_vision_interval: float = 1.0,
+        capture_dir: Optional[str] = None,
+        server_mode: str = DEFAULT_SERVER_MODE,
     ):
+        if server_mode not in VALID_SERVER_MODES:
+            raise ValueError(f"invalid server mode: {server_mode}")
         self.host = host
         self.port = port
 
         self.view = view
         self.device = device
         self.client_idle_timeout = float(client_idle_timeout)
+        self.server_mode = server_mode
+        self.segmentation_only = self.server_mode == "segmentation_only"
+        self.labeling_only = self.server_mode == "labeling"
+        self.full_mahjong = self.server_mode == "full_mahjong"
+        self.capture_dir = Path(capture_dir) if capture_dir else None
+        if self.capture_dir is not None:
+            self.capture_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[Capture] Labeled sample capture enabled: {self.capture_dir}", flush=True)
+        if self.segmentation_only:
+            print("[PC] Segmentation-only mode: classification and Mahjong agent are disabled.", flush=True)
+        elif self.labeling_only:
+            print("[PC] Labeling mode: segmentation + classification; Mahjong agent is disabled.", flush=True)
+        else:
+            print("[PC] Full Mahjong mode: segmentation + classification + Mahjong agent.", flush=True)
 
         # Models / pipeline
         self.vision = VisionPipeline(
             yolo_path=yolo_path,
-            cls_path=cls_path,
+            cls_path=None if self.segmentation_only else cls_path,
             det_imgsz=det_imgsz,
             det_conf=det_conf,
             det_iou=det_iou,
@@ -84,7 +111,7 @@ class InferServer:
         self.tracker = Tracker(track_iou=track_iou, track_ttl=track_ttl, smooth_len=smooth_len)
 
         # Mahjong PPO model (optional)
-        self.ppo_model = mahjong.load_ppo_model(ppo_model_path, ppo_device=ppo_device)
+        self.ppo_model = mahjong.load_ppo_model(ppo_model_path, ppo_device=ppo_device) if self.full_mahjong else None
         self.game_tracker = mahjong.GameStateTracker()
 
         # Shared (latest frame)
@@ -102,6 +129,8 @@ class InferServer:
         self._live_hand_candidate_signature: Optional[tuple[int, ...]] = None
         self._live_hand_candidate_frames = 0
         self._scene_reset_requested = False
+        self._capture_requests: List[Dict[str, Any]] = []
+        self._samples_saved = 0
         self._lock = threading.Lock()
 
     def _handle_control_packet(self, payload: bytes) -> bool:
@@ -123,7 +152,156 @@ class InferServer:
             print("[Control] scene reset requested", flush=True)
             return True
 
+        if command in ("capture_sample", "save_sample", "capture_segmentation_sample"):
+            request = {
+                "requested_at_epoch": time.time(),
+                "requested_at_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "command": command,
+                "sequence": msg.get("sequence"),
+                "source": msg.get("source", "quest"),
+            }
+            with self._lock:
+                self._capture_requests.append(request)
+                pending = len(self._capture_requests)
+            print(f"[Capture] sample requested (pending={pending})", flush=True)
+            return True
+
         return True
+
+    def _pop_capture_request(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if not self._capture_requests:
+                return None
+            return self._capture_requests.pop(0)
+
+    @staticmethod
+    def _tile_bbox_xyxy(tile: Dict[str, Any], img_w: int, img_h: int) -> List[int]:
+        cx = float(tile.get("cx", 0.0))
+        cy = float(tile.get("cy", 0.0))
+        bw = float(tile.get("w", 0.0))
+        bh = float(tile.get("h", 0.0))
+        x1 = max(0, min(img_w - 1, int(round((cx - bw / 2.0) * img_w))))
+        y1 = max(0, min(img_h - 1, int(round((cy - bh / 2.0) * img_h))))
+        x2 = max(0, min(img_w - 1, int(round((cx + bw / 2.0) * img_w))))
+        y2 = max(0, min(img_h - 1, int(round((cy + bh / 2.0) * img_h))))
+        return [x1, y1, x2, y2]
+
+    def _build_capture_prediction(self, sample_id: str, out: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
+        img_w = int(out.get("img_w", 0) or 0)
+        img_h = int(out.get("img_h", 0) or 0)
+        tiles: List[Dict[str, Any]] = []
+
+        for idx, tile in enumerate(out.get("tiles", []) or []):
+            if not isinstance(tile, dict):
+                continue
+            bbox_xyxy = self._tile_bbox_xyxy(tile, img_w, img_h) if img_w > 0 and img_h > 0 else [0, 0, 0, 0]
+            tiles.append(
+                {
+                    "index": idx,
+                    "track_id": int(tile.get("id", idx)),
+                    "predicted_label": str(tile.get("cls", "")),
+                    "confidence": float(tile.get("conf", 0.0) or 0.0),
+                    "area": str(tile.get("area", "") or ""),
+                    "bbox_norm": {
+                        "cx": float(tile.get("cx", 0.0) or 0.0),
+                        "cy": float(tile.get("cy", 0.0) or 0.0),
+                        "w": float(tile.get("w", 0.0) or 0.0),
+                        "h": float(tile.get("h", 0.0) or 0.0),
+                    },
+                    "bbox_xyxy": bbox_xyxy,
+                }
+            )
+
+        captured_at = time.time()
+        return {
+            "schema_version": 1,
+            "sample_id": sample_id,
+            "captured_at_epoch": captured_at,
+            "captured_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(captured_at)),
+            "request": request,
+            "image_file": "original.jpg",
+            "preview_file": "preview.jpg",
+            "image": {
+                "width": img_w,
+                "height": img_h,
+            },
+            "conditions": {
+                "distance": "",
+                "angle": "",
+                "lighting": "",
+            },
+            "tiles": tiles,
+            "hand": out.get("hand", []),
+            "table": out.get("table", []),
+            "debug": out.get("debug", {}),
+        }
+
+    def _write_capture_preview(self, frame_bgr, prediction: Dict[str, Any], preview_path: Path) -> None:
+        vis = frame_bgr.copy()
+        colors = {
+            "hand": (0, 210, 120),
+            "table": (255, 170, 40),
+            "": (80, 220, 255),
+        }
+        for tile in prediction.get("tiles", []):
+            bbox = tile.get("bbox_xyxy", [0, 0, 0, 0])
+            if len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            area = str(tile.get("area", "") or "")
+            color = colors.get(area, colors[""])
+            text = str(tile.get("index", 0))
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                vis,
+                text,
+                (x1, max(12, y1 - 4)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        cv2.imwrite(str(preview_path), vis)
+
+    def _save_capture_sample(
+        self,
+        jpg: bytes,
+        frame_bgr,
+        out: Dict[str, Any],
+        request: Dict[str, Any],
+    ) -> Optional[Path]:
+        if self.capture_dir is None:
+            print("[Capture] request ignored: capture directory is disabled", flush=True)
+            return None
+
+        now = time.time()
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+        millis = int((now - int(now)) * 1000)
+        sample_id = f"{stamp}_{millis:03d}_{self._samples_saved:04d}"
+        sample_dir = self.capture_dir / sample_id
+        while sample_dir.exists():
+            self._samples_saved += 1
+            sample_id = f"{stamp}_{millis:03d}_{self._samples_saved:04d}"
+            sample_dir = self.capture_dir / sample_id
+
+        sample_dir.mkdir(parents=True, exist_ok=False)
+        (sample_dir / "original.jpg").write_bytes(jpg)
+
+        prediction = self._build_capture_prediction(sample_id, out, request)
+        (sample_dir / "prediction.json").write_text(
+            json.dumps(prediction, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._write_capture_preview(frame_bgr, prediction, sample_dir / "preview.jpg")
+
+        self._samples_saved += 1
+        print(
+            f"[Capture] saved sample {sample_id} "
+            f"({len(prediction.get('tiles', []))} objects) -> {sample_dir}",
+            flush=True,
+        )
+        return sample_dir
 
     def _set_latest_and_get_effective_hand(
         self,
@@ -361,6 +539,31 @@ class InferServer:
             return -1
 
     def _format_pc_log(self, out: Dict[str, Any]) -> str:
+        if out.get("mode") == "segmentation_only":
+            tiles = out.get("tiles", [])
+            debug = out.get("debug", {}) if isinstance(out.get("debug"), dict) else {}
+            return "\n".join(
+                [
+                    f"Segmentation: {len(tiles)} objects",
+                    f"Vision: {float(debug.get('vision_ms', 0.0) or 0.0):.1f} ms",
+                    "A: save segmentation sample",
+                ]
+            )
+        if out.get("mode") == "labeling":
+            tiles = out.get("tiles", [])
+            debug = out.get("debug", {}) if isinstance(out.get("debug"), dict) else {}
+            labels = " ".join(str(t.get("cls", "")) for t in tiles[:12] if t.get("cls"))
+            if len(tiles) > 12:
+                labels += " ..."
+            return "\n".join(
+                [
+                    f"Labels: {len(tiles)} objects",
+                    labels or "(none)",
+                    f"Vision: {float(debug.get('vision_ms', 0.0) or 0.0):.1f} ms",
+                    "A: save labeled sample",
+                ]
+            )
+
         hand = out.get("hand", [])
         table = out.get("table", [])
         agent = out.get("agent", {})
@@ -396,7 +599,182 @@ class InferServer:
             lines.append("Stable: hand")
         return "\n".join(lines)
 
+    def _infer_segmentation_only(self, frame_bgr) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        scene_reset = self._consume_scene_reset_request()
+        h, w = frame_bgr.shape[:2]
+        ts = time.time()
+
+        det_boxes, det_names, det_confs, area_types, (img_w, img_h) = self.vision.det_and_cls(
+            frame_bgr,
+            stop_event=STOP_EVENT,
+        )
+        t_vision = time.perf_counter()
+
+        tiles: List[Dict[str, Any]] = []
+        for idx, (box, name, conf, area_type) in enumerate(zip(det_boxes, det_names, det_confs, area_types)):
+            x1, y1, x2, y2 = box
+            cx = ((x1 + x2) / 2.0) / w
+            cy = ((y1 + y2) / 2.0) / h
+            bw = (x2 - x1) / w
+            bh = (y2 - y1) / h
+            tiles.append(
+                {
+                    "id": idx,
+                    "cls": str(name or area_type or "object"),
+                    "conf": float(conf),
+                    "area": str(area_type or name or ""),
+                    "cx": float(cx),
+                    "cy": float(cy),
+                    "w": float(bw),
+                    "h": float(bh),
+                }
+            )
+
+        if self.view:
+            vis = frame_bgr.copy()
+            for t in tiles:
+                x1 = int((t["cx"] - t["w"] / 2) * w)
+                y1 = int((t["cy"] - t["h"] / 2) * h)
+                x2 = int((t["cx"] + t["w"] / 2) * w)
+                y2 = int((t["cy"] + t["h"] / 2) * h)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 210, 255), 2)
+                cv2.putText(
+                    vis,
+                    f"{t['cls']} {t['conf']:.2f}",
+                    (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 210, 255),
+                    2,
+                )
+            cv2.imshow("PC Segmentation (press q to quit)", vis)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                STOP_EVENT.set()
+                raise InterruptedError("Quit by 'q'.")
+
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        debug_info: Dict[str, Any] = {
+            "det_count": len(det_boxes),
+            "scene_reset": scene_reset,
+            "vision_ms": (t_vision - t0) * 1000.0,
+            "agent_ms": 0.0,
+            "total_ms": total_ms,
+            "segmentation_only": True,
+        }
+        empty_advice = {
+            "benefit": {"tile_id": -1, "tile": "", "source": "", "reason": ""},
+            "safe": {"tile_id": -1, "tile": "", "source": "", "reason": ""},
+        }
+        return {
+            "mode": "segmentation_only",
+            "ts": ts,
+            "img_w": img_w or w,
+            "img_h": img_h or h,
+            "tiles": tiles,
+            "hand": [],
+            "table": [],
+            "detected_hand_tiles": [],
+            "hand_stable": False,
+            "hand_stable_source": "",
+            "agent": {},
+            "advice": empty_advice,
+            "debug": debug_info,
+        }
+
+    def _infer_labeling_only(self, frame_bgr) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        scene_reset = self._consume_scene_reset_request()
+        h, w = frame_bgr.shape[:2]
+        ts = time.time()
+
+        det_boxes, cls_names, cls_confs, area_types, (img_w, img_h) = self.vision.det_and_cls(
+            frame_bgr,
+            stop_event=STOP_EVENT,
+        )
+        t_vision = time.perf_counter()
+
+        tiles: List[Dict[str, Any]] = []
+        for idx, (box, name, conf, area_type) in enumerate(zip(det_boxes, cls_names, cls_confs, area_types)):
+            x1, y1, x2, y2 = box
+            cx = ((x1 + x2) / 2.0) / w
+            cy = ((y1 + y2) / 2.0) / h
+            bw = (x2 - x1) / w
+            bh = (y2 - y1) / h
+            tiles.append(
+                {
+                    "id": idx,
+                    "cls": str(name or ""),
+                    "conf": float(conf),
+                    "area": str(area_type or ""),
+                    "cx": float(cx),
+                    "cy": float(cy),
+                    "w": float(bw),
+                    "h": float(bh),
+                }
+            )
+
+        if self.view:
+            vis = frame_bgr.copy()
+            for t in tiles:
+                x1 = int((t["cx"] - t["w"] / 2) * w)
+                y1 = int((t["cy"] - t["h"] / 2) * h)
+                x2 = int((t["cx"] + t["w"] / 2) * w)
+                y2 = int((t["cy"] + t["h"] / 2) * h)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(
+                    vis,
+                    f"{t['cls']} {t['conf']:.2f}",
+                    (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                )
+            cv2.imshow("PC Labeling (press q to quit)", vis)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                STOP_EVENT.set()
+                raise InterruptedError("Quit by 'q'.")
+
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        debug_info: Dict[str, Any] = {
+            "det_count": len(det_boxes),
+            "scene_reset": scene_reset,
+            "vision_ms": (t_vision - t0) * 1000.0,
+            "agent_ms": 0.0,
+            "total_ms": total_ms,
+            "segmentation_only": False,
+            "classification_enabled": True,
+            "mahjong_agent_enabled": False,
+        }
+        empty_advice = {
+            "benefit": {"tile_id": -1, "tile": "", "source": "", "reason": ""},
+            "safe": {"tile_id": -1, "tile": "", "source": "", "reason": ""},
+        }
+        return {
+            "mode": "labeling",
+            "ts": ts,
+            "img_w": img_w or w,
+            "img_h": img_h or h,
+            "tiles": tiles,
+            "hand": [],
+            "table": [],
+            "detected_hand_tiles": [],
+            "hand_stable": False,
+            "hand_stable_source": "",
+            "agent": {},
+            "advice": empty_advice,
+            "debug": debug_info,
+        }
+
     def _infer_once(self, frame_bgr) -> Dict[str, Any]:
+        if self.segmentation_only:
+            return self._infer_segmentation_only(frame_bgr)
+        if self.labeling_only:
+            return self._infer_labeling_only(frame_bgr)
+
         t0 = time.perf_counter()
         scene_reset = self._consume_scene_reset_request()
         h, w = frame_bgr.shape[:2]
@@ -663,6 +1041,7 @@ class InferServer:
                     self._live_hand_candidate_signature = None
                     self._live_hand_candidate_frames = 0
                     self._scene_reset_requested = False
+                    self._capture_requests.clear()
                     self.tracker.reset()
                     self.game_tracker.reset_runtime()
 
@@ -717,6 +1096,10 @@ class InferServer:
                                 frame = decode_jpg(jpg)
                                 out = self._infer_once(frame)
                                 out.setdefault("debug", {})["pc_frame_age_ms"] = (time.time() - frame_ts) * 1000.0
+                                capture_request = self._pop_capture_request()
+                                if capture_request is not None:
+                                    sample_dir = self._save_capture_sample(jpg, frame, out, capture_request)
+                                    out.setdefault("debug", {})["last_capture_sample"] = str(sample_dir or "")
                                 pc_log = self._format_pc_log(out)
                                 out["pc_log"] = pc_log
 
@@ -767,8 +1150,44 @@ class InferServer:
 
 def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--yolo", required=True, help="path to YOLO detect/segment .pt")
-    ap.add_argument("--cls", required=True, help="path to classification .pt/.pth (MobileNetV3 Small weights)")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--segmentation-only",
+        dest="server_mode",
+        action="store_const",
+        const="segmentation_only",
+        help="run only best_segmentation.pt; do not load classification/PPO models",
+    )
+    mode.add_argument(
+        "--labeling",
+        dest="server_mode",
+        action="store_const",
+        const="labeling",
+        help="run segmentation + classification labels without Mahjong agent (default)",
+    )
+    mode.add_argument(
+        "--full-mahjong",
+        dest="server_mode",
+        action="store_const",
+        const="full_mahjong",
+        help="enable classification model and Mahjong agent flow",
+    )
+    ap.set_defaults(server_mode=DEFAULT_SERVER_MODE)
+    ap.add_argument(
+        "--model-root",
+        default=str(DEFAULT_MODEL_ROOT),
+        help="directory containing best_segmentation.pt, best_classification.pt, and optional PPO zip",
+    )
+    ap.add_argument(
+        "--yolo",
+        default=None,
+        help=f"path to YOLO detect/segment .pt; defaults to --model-root/{DEFAULT_YOLO_NAME}",
+    )
+    ap.add_argument(
+        "--cls",
+        default=None,
+        help=f"path to classification .pt/.pth; defaults to --model-root/{DEFAULT_CLS_NAME}",
+    )
 
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=5000)
@@ -782,7 +1201,11 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--cls-labels", default=None, help="optional labels txt (one class name per line)")
     ap.add_argument("--cls-nc", type=int, default=None, help="optional override num_classes if inference fails")
 
-    ap.add_argument("--ppo-model", default=None, help="path to SB3 PPO zip model (e.g., tw_mahjong_ppo_gpu.zip)")
+    ap.add_argument(
+        "--ppo-model",
+        default=None,
+        help=f"path to SB3 PPO zip model; defaults to --model-root/{DEFAULT_PPO_NAME}, pass an empty string to disable",
+    )
     ap.add_argument("--ppo-device", default=None, help="SB3 device: cpu / cuda / cuda:0 (optional)")
 
     ap.add_argument("--print-interval", type=float, default=10.0, help="seconds between terminal advice prints")
@@ -799,9 +1222,14 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--smooth-len", type=int, default=5)
 
     ap.add_argument("--view", action="store_true", help="show debug window")
-    ap.add_argument("--debug-vision", action="store_true", help="save Quest frame and classification crops periodically")
+    ap.add_argument("--debug-vision", action="store_true", help="save Quest frame and optional classification crops periodically")
     ap.add_argument("--debug-dir", default="debug_runtime", help="directory for --debug-vision dumps")
     ap.add_argument("--debug-interval", type=float, default=1.0, help="seconds between vision debug dumps")
+    ap.add_argument(
+        "--capture-dir",
+        default="segmentation_samples",
+        help="directory for A-button labeled samples; pass an empty string to disable",
+    )
     ap.add_argument(
         "--device",
         default=None,
@@ -812,7 +1240,32 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main():
-    args = build_argparser().parse_args()
+    parser = build_argparser()
+    args = parser.parse_args()
+
+    model_root = Path(args.model_root)
+    args.yolo = args.yolo or str(model_root / DEFAULT_YOLO_NAME)
+
+    if not Path(args.yolo).is_file():
+        parser.error(f"--yolo model file not found: {args.yolo}")
+
+    classification_enabled = args.server_mode in ("labeling", "full_mahjong")
+    mahjong_agent_enabled = args.server_mode == "full_mahjong"
+
+    if classification_enabled:
+        args.cls = args.cls or str(model_root / DEFAULT_CLS_NAME)
+        if not Path(args.cls).is_file():
+            parser.error(f"--cls model file not found: {args.cls}")
+    else:
+        args.cls = None
+
+    if mahjong_agent_enabled:
+        if args.ppo_model is None:
+            args.ppo_model = str(model_root / DEFAULT_PPO_NAME)
+        if args.ppo_model and not Path(args.ppo_model).is_file():
+            parser.error(f"--ppo-model file not found: {args.ppo_model}")
+    else:
+        args.ppo_model = None
 
     srv = InferServer(
         yolo_path=args.yolo,
@@ -832,11 +1285,13 @@ def main():
         cls_labels_path=args.cls_labels,
         cls_nc=args.cls_nc,
         cls_conf_threshold=args.cls_conf,
-        ppo_model_path=args.ppo_model,
+        ppo_model_path=args.ppo_model or None,
         ppo_device=args.ppo_device,
         client_idle_timeout=args.client_idle_timeout,
         debug_vision_dir=args.debug_dir if args.debug_vision else None,
         debug_vision_interval=args.debug_interval,
+        capture_dir=args.capture_dir or None,
+        server_mode=args.server_mode,
     )
 
     srv.serve_forever(print_interval_sec=args.print_interval)

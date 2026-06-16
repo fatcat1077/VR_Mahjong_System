@@ -1,5 +1,7 @@
 */runs/
 */venv/
+__pycache__/
+*.pyc
 *.pt
 
 #classification 下
@@ -14,6 +16,9 @@ mahjong_agent/models
 #server下
 server/photoes
 server/server_A/dumps
+server/*.log
+server/debug_runtime/
+server/segmentation_samples/
 
 #Unity下
 Unity/*

@@ -160,12 +160,12 @@ class TorchMBV3SmallClassifier:
 
 
 class VisionPipeline:
-    """Detection + classification wrapper."""
+    """Segmentation/detection wrapper, with optional crop classification for full Mahjong mode."""
 
     def __init__(
         self,
         yolo_path: str,
-        cls_path: str,
+        cls_path: Optional[str],
         det_imgsz: int,
         det_conf: float,
         det_iou: float,
@@ -204,30 +204,33 @@ class VisionPipeline:
         if self.det_task not in ("detect", "segment"):
             print("[DET] Warning: detection model task is neither 'detect' nor 'segment'.")
 
-        self.cls_backend = "torch"
+        self.cls_backend = "disabled"
         self.cls_model = None
         self.torch_cls: Optional[TorchMBV3SmallClassifier] = None
 
-        labels = _load_label_list(cls_labels_path)
-
-        # Try Ultralytics classify model first; fallback to Torch MBV3 Small
-        try:
-            tmp = YOLO(cls_path)
-            if getattr(tmp, "task", None) == "classify":
-                self.cls_backend = "ultralytics"
-                self.cls_model = tmp
-                print("[CLS] Using Ultralytics classify model.")
-            else:
-                raise RuntimeError(f"Ultralytics model task={getattr(tmp, 'task', None)} (not classify)")
-        except Exception as e:
-            print(f"[CLS] Ultralytics load failed or not classify -> use Torch MobileNetV3 Small. Reason: {e}")
-            self.torch_cls = TorchMBV3SmallClassifier(
-                weights_path=cls_path,
-                device=self.torch_device,
-                img_size=self.cls_imgsz,
-                labels=labels,
-                override_num_classes=cls_nc,
-            )
+        if cls_path:
+            labels = _load_label_list(cls_labels_path)
+            # Try Ultralytics classify model first; fallback to Torch MBV3 Small
+            try:
+                tmp = YOLO(cls_path)
+                if getattr(tmp, "task", None) == "classify":
+                    self.cls_backend = "ultralytics"
+                    self.cls_model = tmp
+                    print("[CLS] Using Ultralytics classify model.")
+                else:
+                    raise RuntimeError(f"Ultralytics model task={getattr(tmp, 'task', None)} (not classify)")
+            except Exception as e:
+                print(f"[CLS] Ultralytics load failed or not classify -> use Torch MobileNetV3 Small. Reason: {e}")
+                self.cls_backend = "torch"
+                self.torch_cls = TorchMBV3SmallClassifier(
+                    weights_path=cls_path,
+                    device=self.torch_device,
+                    img_size=self.cls_imgsz,
+                    labels=labels,
+                    override_num_classes=cls_nc,
+                )
+        else:
+            print("[CLS] Disabled; running segmentation-only.")
 
         self._warned_no_probs = False
 
@@ -249,6 +252,17 @@ class VisionPipeline:
             return None
         return (x1, y1, x2, y2)
 
+    @staticmethod
+    def clip_box(box, w: int, h: int) -> Optional[Box]:
+        x1, y1, x2, y2 = box
+        x1 = max(0, min(w - 1, int(round(float(x1)))))
+        y1 = max(0, min(h - 1, int(round(float(y1)))))
+        x2 = max(0, min(w - 1, int(round(float(x2)))))
+        y2 = max(0, min(h - 1, int(round(float(y2)))))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
+
     def _extract_detection_boxes(self, det_res) -> np.ndarray:
         """Return boxes in xyxy regardless of detect/segment backend output."""
         if getattr(det_res, "boxes", None) is None or len(det_res.boxes) == 0:
@@ -263,6 +277,20 @@ class VisionPipeline:
         if cls is None:
             return np.full((len(det_res.boxes),), -1, dtype=np.int32)
         return cls.cpu().numpy().astype(np.int32)
+
+    def _extract_detection_confs(self, det_res) -> np.ndarray:
+        """Return detection confidence, or 1.0 when unavailable."""
+        if getattr(det_res, "boxes", None) is None or len(det_res.boxes) == 0:
+            return np.empty((0,), dtype=np.float32)
+        conf = getattr(det_res.boxes, "conf", None)
+        if conf is None:
+            return np.ones((len(det_res.boxes),), dtype=np.float32)
+        return conf.cpu().numpy().astype(np.float32)
+
+    def _class_name_for_class(self, class_id: int) -> str:
+        if class_id < 0:
+            return "object"
+        return str(getattr(self.det_model, "names", {}).get(int(class_id), f"class_{class_id}"))
 
     def _area_type_for_class(self, class_id: int) -> Optional[str]:
         if class_id < 0:
@@ -376,9 +404,14 @@ class VisionPipeline:
             f"det_iou={self.det_iou}",
             f"crop_pad={self.crop_pad}",
             f"cls_backend={self.cls_backend}",
-            f"cls_imgsz={self.cls_imgsz}",
-            f"cls_conf_threshold={self.cls_conf_threshold}",
         ]
+        if self.cls_backend != "disabled":
+            meta.extend(
+                [
+                    f"cls_imgsz={self.cls_imgsz}",
+                    f"cls_conf_threshold={self.cls_conf_threshold}",
+                ]
+            )
         return dump_dir, meta
 
     def _save_debug_crop(
@@ -413,10 +446,10 @@ class VisionPipeline:
         (dump_dir / "meta.txt").write_text("\n".join(meta) + "\n", encoding="utf-8")
 
     def det_and_cls(self, frame_bgr: np.ndarray, stop_event=None):
-        """Run detection/segmentation, then crop+classification.
+        """Run segmentation/detection, optionally followed by crop classification.
 
         Returns: (valid_boxes_xyxy, valid_names, valid_confs, valid_area_types, (w, h))
-        where boxes are expanded crop boxes and remain compatible with the Unity client.
+        In segmentation-only mode, names/confs come directly from the segmentation model.
         """
         h, w = frame_bgr.shape[:2]
         debug_dump_dir, debug_meta = self._open_debug_dump(frame_bgr)
@@ -438,9 +471,40 @@ class VisionPipeline:
             return [], [], [], [], (w, h)
 
         det_classes = self._extract_detection_classes(det_res)
+        det_confs = self._extract_detection_confs(det_res)
         masks = self._extract_masks(det_res)
         if debug_meta is not None:
             debug_meta.append(f"detections={boxes.shape[0]}")
+
+        if self.cls_backend == "disabled":
+            valid_boxes: List[Box] = []
+            valid_names: List[str] = []
+            valid_confs: List[float] = []
+            valid_area_types: List[Optional[str]] = []
+            for i, b in enumerate(boxes):
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("Stopped by user.")
+                clipped = self.clip_box(b, w, h)
+                if clipped is None:
+                    continue
+                class_id = int(det_classes[i]) if i < len(det_classes) else -1
+                name = self._class_name_for_class(class_id)
+                conf = float(det_confs[i]) if i < len(det_confs) else 1.0
+                area_type = self._area_type_for_class(class_id)
+                valid_boxes.append(clipped)
+                valid_names.append(name)
+                valid_confs.append(conf)
+                valid_area_types.append(area_type)
+                if debug_meta is not None:
+                    debug_meta.append(
+                        f"{i:02d}: seg_class={name} area={area_type or 'unknown'} "
+                        f"conf={conf:.4f} box={tuple(int(v) for v in clipped)}"
+                    )
+
+            self._finish_debug_dump(debug_dump_dir, debug_meta)
+            return valid_boxes, valid_names, valid_confs, valid_area_types, (w, h)
+
+        if debug_meta is not None:
             debug_meta.append(f"classify_accept_conf>={self.cls_conf_threshold}")
 
         cls_names: List[str] = []

@@ -3,28 +3,31 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-$Python = Join-Path $Root "venv\Scripts\python.exe"
-if (-not (Test-Path $Python)) {
-    throw "Missing server venv Python: $Python"
+$PythonCandidates = @(
+    (Join-Path $Root "venv\Scripts\python.exe"),
+    "C:\Users\user\Desktop\VR_Mahjong_System\server\venv\Scripts\python.exe"
+)
+$Python = $PythonCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $Python) {
+    throw "Missing server venv Python. Tried: $($PythonCandidates -join ', ')"
 }
 
 $ModelRoot = "D:\Download\final_models\final_models"
 $Yolo = Join-Path $ModelRoot "best_segmentation.pt"
 $Cls = Join-Path $ModelRoot "best_classification.pt"
-$Ppo = Join-Path $ModelRoot "masked_cont100m_to150m_seed42_plus25m.zip"
 $DebugDir = Join-Path $Root "debug_runtime"
+$CaptureDir = Join-Path $Root "segmentation_samples"
 
-foreach ($Path in @($Yolo, $Cls, $Ppo)) {
+foreach ($Path in @($Yolo, $Cls)) {
     if (-not (Test-Path $Path)) {
         throw "Missing required model file: $Path"
     }
 }
 
 & $Python "server_A\main.py" `
+    --labeling `
     --yolo $Yolo `
     --cls $Cls `
-    --ppo-model $Ppo `
-    --ppo-device cpu `
     --host 0.0.0.0 `
     --port 5000 `
     --client-idle-timeout 5 `
@@ -34,4 +37,5 @@ foreach ($Path in @($Yolo, $Cls, $Ppo)) {
     --cls-conf 0.5 `
     --debug-vision `
     --debug-dir $DebugDir `
-    --debug-interval 1
+    --debug-interval 1 `
+    --capture-dir $CaptureDir

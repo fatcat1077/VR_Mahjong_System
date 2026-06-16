@@ -50,6 +50,12 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         [Header("Mahjong Scene Reset")]
         [SerializeField] private OVRInput.RawButton m_resetSceneButton = OVRInput.RawButton.X;
 
+        [Header("Segmentation Sample Capture")]
+        [SerializeField] private OVRInput.RawButton m_captureSampleButton = OVRInput.RawButton.A;
+        [SerializeField] private OVRInput.Button m_captureSampleVirtualButton = OVRInput.Button.One;
+        [SerializeField] private KeyCode m_captureSampleKey = KeyCode.A;
+        [SerializeField] private float m_captureSampleCooldownSec = 0.35f;
+
         // Networking
         private TcpClient _client;
         private NetworkStream _stream;
@@ -81,6 +87,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         private int _recvFailures;
         private int _lastSentBytes;
         private int _sceneResetRequests;
+        private int _sampleCaptureRequests;
+        private float _lastSampleCaptureTime = -999f;
 
         // =========================================================
         // ✅ Original Sentis fields (保留，避免 Editor/其他腳本報錯)
@@ -236,6 +244,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         private void StreamUpdate()
         {
             HandleSceneResetInput();
+            HandleSampleCaptureInput();
             RefreshLatestStreamTexture();
 
             // auto reconnect
@@ -342,29 +351,68 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         }
 
         [Serializable]
-        private class SceneResetControl
+        private class ControlMessage
         {
             public string type = "control";
-            public string command = "scene_reset";
+            public string command;
+            public int sequence;
+            public string source = "quest";
         }
 
         private void SendSceneResetControl()
         {
-            if (_stream == null || !_connected)
+            if (SendControl("scene_reset", _sceneResetRequests + 1))
+            {
+                Interlocked.Increment(ref _sceneResetRequests);
+                Debug.Log("[Stream] Scene reset requested");
+            }
+        }
+
+        private void HandleSampleCaptureInput()
+        {
+            if (!(OVRInput.GetUp(m_captureSampleButton) ||
+                  OVRInput.GetUp(m_captureSampleVirtualButton) ||
+                  Input.GetKeyUp(m_captureSampleKey) ||
+                  Input.GetKeyUp(KeyCode.JoystickButton0)))
                 return;
+
+            if (Time.unscaledTime - _lastSampleCaptureTime < Mathf.Max(0.05f, m_captureSampleCooldownSec))
+                return;
+
+            _lastSampleCaptureTime = Time.unscaledTime;
+            SendSampleCaptureControl();
+        }
+
+        private void SendSampleCaptureControl()
+        {
+            if (SendControl("capture_sample", _sampleCaptureRequests + 1))
+            {
+                Interlocked.Increment(ref _sampleCaptureRequests);
+                Debug.Log("[Stream] Segmentation sample capture requested");
+            }
+        }
+
+        private bool SendControl(string command, int sequence)
+        {
+            if (_stream == null || !_connected)
+                return false;
 
             try
             {
-                var msg = new SceneResetControl();
+                var msg = new ControlMessage
+                {
+                    command = command,
+                    sequence = sequence,
+                };
                 var payload = Encoding.UTF8.GetBytes(JsonUtility.ToJson(msg));
                 WriteLengthPrefixed(payload);
-                Interlocked.Increment(ref _sceneResetRequests);
-                Debug.Log("[Stream] Scene reset requested");
+                return true;
             }
             catch (Exception e)
             {
                 Interlocked.Increment(ref _sendFailures);
-                Debug.LogWarning($"[Stream] Scene reset control failed: {e.Message}");
+                Debug.LogWarning($"[Stream] Control '{command}' failed: {e.Message}");
+                return false;
             }
         }
 
@@ -634,7 +682,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 $"[QUEST] stream={(_connected ? "connected" : "disconnected")} " +
                 $"targetFps={m_sendFps} size={m_streamSize.x}x{m_streamSize.y} q={m_jpegQuality} " +
                 $"queued={_framesQueued} sent={_framesSent} recv={_responsesReceived} " +
-                $"sceneReset={_sceneResetRequests} " +
+                $"sceneReset={_sceneResetRequests} capture={_sampleCaptureRequests} " +
                 $"pending={pending} capture={capture} lastKB={_lastSentBytes / 1024f:0.0} " +
                 $"connects={_connectAttempts} sendErr={_sendFailures} recvErr={_recvFailures} jsonErr={_jsonParseErrors}";
             m_menuUi.SetStreamDebug(debug);
