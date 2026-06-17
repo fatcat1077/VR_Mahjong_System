@@ -1,0 +1,40 @@
+{
+  "models": [
+    {
+      "model_name": "best_baseline",
+      "pt_path": "D:\\Download\\latency_4_models\\latency_4_models\\best_baseline.pt",
+      "onnx_server_path": "C:\\Users\\user\\Desktop\\VR_Mahjong_System\\server\\models\\Latency4Segmentation\\onnx\\latency4_best_baseline.onnx",
+      "unity_resource": "BenchmarkModels/latency4_best_baseline",
+      "imgsz": 416,
+      "parameters": 3264006,
+      "task": "segment"
+    },
+    {
+      "model_name": "best_kd",
+      "pt_path": "D:\\Download\\latency_4_models\\latency_4_models\\best_kd.pt",
+      "onnx_server_path": "C:\\Users\\user\\Desktop\\VR_Mahjong_System\\server\\models\\Latency4Segmentation\\onnx\\latency4_best_kd.onnx",
+      "unity_resource": "BenchmarkModels/latency4_best_kd",
+      "imgsz": 416,
+      "parameters": 3264006,
+      "task": "segment"
+    },
+    {
+      "model_name": "best_p2",
+      "pt_path": "D:\\Download\\latency_4_models\\latency_4_models\\best_p2.pt",
+      "onnx_server_path": "C:\\Users\\user\\Desktop\\VR_Mahjong_System\\server\\models\\Latency4Segmentation\\onnx\\latency4_best_p2.onnx",
+      "unity_resource": "BenchmarkModels/latency4_best_p2",
+      "imgsz": 416,
+      "parameters": 3180776,
+      "task": "segment"
+    },
+    {
+      "model_name": "best_p2_and_kd",
+      "pt_path": "D:\\Download\\latency_4_models\\latency_4_models\\best_p2_and_kd.pt",
+      "onnx_server_path": "C:\\Users\\user\\Desktop\\VR_Mahjong_System\\server\\models\\Latency4Segmentation\\onnx\\latency4_best_p2_and_kd.onnx",
+      "unity_resource": "BenchmarkModels/latency4_best_p2_and_kd",
+      "imgsz": 416,
+      "parameters": 3180776,
+      "task": "segment"
+    }
+  ]
+}

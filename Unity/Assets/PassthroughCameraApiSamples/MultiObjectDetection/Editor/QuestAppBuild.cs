@@ -8,8 +8,23 @@ using UnityEngine;
 public static class QuestAppBuild
 {
     private const string DefaultApkPath = "Builds/VRMahjongSystem.apk";
+    private const string MultiObjectDetectionScene = "Assets/PassthroughCameraApiSamples/MultiObjectDetection/MultiObjectDetection.unity";
 
     public static void BuildAndroidApk()
+    {
+        var scenes = EditorBuildSettings.scenes
+            .Where(scene => scene.enabled)
+            .Select(scene => scene.path)
+            .ToArray();
+        BuildAndroidApkWithScenes(scenes);
+    }
+
+    public static void BuildMultiObjectDetectionApk()
+    {
+        BuildAndroidApkWithScenes(new[] { MultiObjectDetectionScene });
+    }
+
+    private static void BuildAndroidApkWithScenes(string[] scenes)
     {
         var projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
         var apkPath = Environment.GetEnvironmentVariable("QUEST_APK_PATH");
@@ -21,11 +36,6 @@ public static class QuestAppBuild
         {
             apkPath = Path.GetFullPath(Path.Combine(projectRoot, apkPath));
         }
-
-        var scenes = EditorBuildSettings.scenes
-            .Where(scene => scene.enabled)
-            .Select(scene => scene.path)
-            .ToArray();
 
         if (scenes.Length == 0)
         {

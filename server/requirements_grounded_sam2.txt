@@ -1,0 +1,11 @@
+# Extra dependencies for the GroundingDINO + SAM2.1 latency server.
+accelerate==1.14.0
+hf-xet==1.5.1
+huggingface_hub==1.19.0
+hydra-core==1.3.3
+iopath==0.1.10
+omegaconf==2.3.1
+safetensors==0.8.0
+SAM-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4
+tokenizers==0.22.2
+transformers==5.12.1

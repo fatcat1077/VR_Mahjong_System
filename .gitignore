@@ -14,6 +14,10 @@ mahjong_agent/models
 #server下
 server/photoes
 server/server_A/dumps
+server/seg_latency_results/
+server/models/GroundedSAM2/checkpoints/
+server/models/GroundedSAM2/grounding-dino-base/
+server/models/GroundedSAM2/onnx_attempts/
 
 #Unity下
 Unity/*
