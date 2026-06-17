@@ -1,0 +1,10 @@
+﻿flow_run,component,avg_ms,share_percent
+20260617_161017_full_pipeline,JPEG decode,30.081,5.05
+20260617_161017_full_pipeline,Segmentation predict,115.067,19.3
+20260617_161017_full_pipeline,Detection postprocess,169.746,28.47
+20260617_161017_full_pipeline,Crop / mask generation,136.558,22.91
+20260617_161017_full_pipeline,Batch classification,122.083,20.48
+20260617_161017_full_pipeline,Mahjong agent / PPO block,6.928,1.16
+20260617_161017_full_pipeline,Tracking + tile build + hand parse,9.069,1.52
+20260617_161017_full_pipeline,JSON serialize + socket send,1.148,0.19
+20260617_161017_full_pipeline,Other overhead,5.452,0.91

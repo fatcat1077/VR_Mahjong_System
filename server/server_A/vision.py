@@ -158,6 +158,41 @@ class TorchMBV3SmallClassifier:
 
         return name, conf_f, cls_id_i
 
+    @torch.no_grad()
+    def predict_bgr_batch(self, crops_bgr: List[np.ndarray]):
+        valid: List[np.ndarray] = []
+        valid_indices: List[int] = []
+        outputs = [("UNKNOWN", 0.0, -1) for _ in crops_bgr]
+
+        for idx, crop_bgr in enumerate(crops_bgr):
+            if crop_bgr is None or crop_bgr.size == 0:
+                continue
+            img = cv2.resize(crop_bgr, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            img = (img - self.mean) / self.std
+            valid.append(img)
+            valid_indices.append(idx)
+
+        if not valid:
+            return outputs
+
+        arr = np.stack(valid, axis=0)
+        x = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous().to(self.device)
+        logits = self.model(x)
+        probs = F.softmax(logits, dim=1)
+        confs, cls_ids = torch.max(probs, dim=1)
+
+        for src_idx, conf, cls_id in zip(valid_indices, confs, cls_ids):
+            cls_id_i = int(cls_id.item())
+            conf_f = float(conf.item())
+            if self.labels is not None and 0 <= cls_id_i < len(self.labels):
+                name = self.labels[cls_id_i]
+            else:
+                name = str(cls_id_i)
+            outputs[src_idx] = (name, conf_f, cls_id_i)
+
+        return outputs
+
 
 class VisionPipeline:
     """Detection + classification wrapper."""
@@ -328,7 +363,88 @@ class VisionPipeline:
             return crop_bgr
         return cv2.resize(crop_bgr, (self.cls_imgsz, self.cls_imgsz), interpolation=cv2.INTER_LINEAR)
 
+    def _sync_for_timing(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        try:
+            if self.device is None:
+                torch.cuda.synchronize()
+            elif str(self.device).startswith("cuda"):
+                torch.cuda.synchronize(torch.device(str(self.device)))
+            elif self.torch_device.type == "cuda":
+                torch.cuda.synchronize(self.torch_device)
+        except Exception:
+            pass
+
     def classify_crop(self, crop_bgr: np.ndarray):
+        results, _ = self.classify_crops_batch([crop_bgr])
+        return results[0] if results else ("UNKNOWN", 0.0)
+
+    def classify_crops_batch(self, crops_bgr: List[np.ndarray], sync_timing: bool = False):
+        timings = {
+            "classification_preprocess_ms": 0.0,
+            "classification_forward_ms": 0.0,
+            "classification_postprocess_ms": 0.0,
+            "classification_total_ms": 0.0,
+        }
+        t_total0 = time.perf_counter()
+
+        t_pre0 = time.perf_counter()
+        prepared = [self._prepare_classification_input(crop) for crop in crops_bgr]
+        timings["classification_preprocess_ms"] = (time.perf_counter() - t_pre0) * 1000.0
+
+        if not prepared:
+            timings["classification_total_ms"] = (time.perf_counter() - t_total0) * 1000.0
+            return [], timings
+
+        if self.cls_backend == "ultralytics":
+            if sync_timing:
+                self._sync_for_timing()
+            t_forward0 = time.perf_counter()
+            cls_results = self.cls_model.predict(
+                prepared,
+                imgsz=self.cls_imgsz,
+                device=self.device,
+                batch=max(1, len(prepared)),
+                verbose=False,
+            )
+            if sync_timing:
+                self._sync_for_timing()
+            timings["classification_forward_ms"] = (time.perf_counter() - t_forward0) * 1000.0
+
+            t_post0 = time.perf_counter()
+            outputs = []
+            for cls_res in cls_results:
+                if cls_res.probs is None:
+                    if not self._warned_no_probs:
+                        print("[CLS][Ultralytics] Warning: cls_res.probs is None (weights may not be a classify model).")
+                        self._warned_no_probs = True
+                    outputs.append(("UNKNOWN", 0.0))
+                    continue
+                top1 = int(cls_res.probs.top1)
+                cconf = float(cls_res.probs.top1conf)
+                cname = cls_res.names.get(top1, str(top1))
+                outputs.append((cname, cconf))
+            timings["classification_postprocess_ms"] = (time.perf_counter() - t_post0) * 1000.0
+            timings["classification_total_ms"] = (time.perf_counter() - t_total0) * 1000.0
+            return outputs, timings
+
+        assert self.torch_cls is not None
+        if sync_timing:
+            self._sync_for_timing()
+        t_forward0 = time.perf_counter()
+        torch_outputs = self.torch_cls.predict_bgr_batch(prepared)
+        if sync_timing:
+            self._sync_for_timing()
+        timings["classification_forward_ms"] = (time.perf_counter() - t_forward0) * 1000.0
+
+        t_post0 = time.perf_counter()
+        outputs = [(cname, cconf) for cname, cconf, _ in torch_outputs]
+        timings["classification_postprocess_ms"] = (time.perf_counter() - t_post0) * 1000.0
+        timings["classification_total_ms"] = (time.perf_counter() - t_total0) * 1000.0
+        return outputs, timings
+
+    def classify_crop_legacy(self, crop_bgr: np.ndarray):
         crop_bgr = self._prepare_classification_input(crop_bgr)
         if self.cls_backend == "ultralytics":
             cls_res = self.cls_model.predict(
@@ -412,15 +528,35 @@ class VisionPipeline:
             return
         (dump_dir / "meta.txt").write_text("\n".join(meta) + "\n", encoding="utf-8")
 
-    def det_and_cls(self, frame_bgr: np.ndarray, stop_event=None):
+    def det_and_cls(self, frame_bgr: np.ndarray, stop_event=None, return_timing: bool = False, sync_timing: bool = False):
         """Run detection/segmentation, then crop+classification.
 
         Returns: (valid_boxes_xyxy, valid_names, valid_confs, valid_area_types, (w, h))
         where boxes are expanded crop boxes and remain compatible with the Unity client.
         """
+        t_all0 = time.perf_counter()
+        timing: Dict[str, float | int | bool | str] = {
+            "segmentation_ms": 0.0,
+            "det_postprocess_ms": 0.0,
+            "crop_ms": 0.0,
+            "classification_preprocess_ms": 0.0,
+            "classification_forward_ms": 0.0,
+            "classification_postprocess_ms": 0.0,
+            "classification_total_ms": 0.0,
+            "valid_filter_ms": 0.0,
+            "vision_total_ms": 0.0,
+            "raw_detection_count": 0,
+            "classified_crop_count": 0,
+            "valid_detection_count": 0,
+            "classification_backend": self.cls_backend,
+            "batch_classification": True,
+        }
         h, w = frame_bgr.shape[:2]
         debug_dump_dir, debug_meta = self._open_debug_dump(frame_bgr)
 
+        if sync_timing:
+            self._sync_for_timing()
+        t_det0 = time.perf_counter()
         det_res = self.det_model.predict(
             frame_bgr,
             imgsz=self.det_imgsz,
@@ -429,55 +565,76 @@ class VisionPipeline:
             device=self.device,
             verbose=False,
         )[0]
+        if sync_timing:
+            self._sync_for_timing()
+        timing["segmentation_ms"] = (time.perf_counter() - t_det0) * 1000.0
 
+        t_post0 = time.perf_counter()
         boxes = self._extract_detection_boxes(det_res)
+        det_classes = self._extract_detection_classes(det_res)
+        masks = self._extract_masks(det_res)
+        timing["det_postprocess_ms"] = (time.perf_counter() - t_post0) * 1000.0
+        timing["raw_detection_count"] = int(boxes.shape[0])
         if boxes.shape[0] == 0:
             if debug_meta is not None:
                 debug_meta.append("detections=0")
             self._finish_debug_dump(debug_dump_dir, debug_meta)
+            timing["vision_total_ms"] = (time.perf_counter() - t_all0) * 1000.0
+            if return_timing:
+                return [], [], [], [], (w, h), timing
             return [], [], [], [], (w, h)
 
-        det_classes = self._extract_detection_classes(det_res)
-        masks = self._extract_masks(det_res)
         if debug_meta is not None:
             debug_meta.append(f"detections={boxes.shape[0]}")
             debug_meta.append(f"classify_accept_conf>={self.cls_conf_threshold}")
 
-        cls_names: List[str] = []
-        cls_confs: List[float] = []
-        area_types: List[Optional[str]] = []
-        crops_xyxy: List[Optional[Box]] = []
+        n_boxes = int(boxes.shape[0])
+        cls_names: List[str] = [""] * n_boxes
+        cls_confs: List[float] = [0.0] * n_boxes
+        area_types: List[Optional[str]] = [None] * n_boxes
+        crops_xyxy: List[Optional[Box]] = [None] * n_boxes
+        raw_crops: List[Optional[np.ndarray]] = [None] * n_boxes
+        crops_for_cls: List[np.ndarray] = []
+        crop_indices: List[int] = []
 
+        t_crop0 = time.perf_counter()
         for i, b in enumerate(boxes):
             if stop_event is not None and stop_event.is_set():
                 raise InterruptedError("Stopped by user.")
 
             eb = self.expand_box(b, w, h)
             if eb is None:
-                crops_xyxy.append(None)
-                cls_names.append("")
-                cls_confs.append(0.0)
-                area_types.append(None)
                 continue
 
-            crops_xyxy.append(eb)
+            crops_xyxy[i] = eb
             mask_i = None
             if masks is not None and i < masks.shape[0]:
                 mask_i = masks[i]
             crop = self._make_classification_crop(frame_bgr, eb, mask_i, w, h)
-
-            cname, cconf = self.classify_crop(crop)
-            cls_names.append(cname)
-            cls_confs.append(float(cconf))
+            raw_crops[i] = crop
+            crops_for_cls.append(crop)
+            crop_indices.append(i)
             class_id = int(det_classes[i]) if i < len(det_classes) else -1
-            area_type = self._area_type_for_class(class_id)
-            area_types.append(area_type)
-            self._save_debug_crop(debug_dump_dir, debug_meta, i, area_type, cname, float(cconf), eb, crop)
+            area_types[i] = self._area_type_for_class(class_id)
+        timing["crop_ms"] = (time.perf_counter() - t_crop0) * 1000.0
+        timing["classified_crop_count"] = len(crops_for_cls)
+
+        batch_outputs, cls_timing = self.classify_crops_batch(crops_for_cls, sync_timing=sync_timing)
+        timing.update(cls_timing)
+
+        for src_idx, (cname, cconf) in zip(crop_indices, batch_outputs):
+            cls_names[src_idx] = cname
+            cls_confs[src_idx] = float(cconf)
+            eb = crops_xyxy[src_idx]
+            crop = raw_crops[src_idx]
+            if eb is not None and crop is not None:
+                self._save_debug_crop(debug_dump_dir, debug_meta, src_idx, area_types[src_idx], cname, float(cconf), eb, crop)
 
         valid_boxes: List[Box] = []
         valid_names: List[str] = []
         valid_confs: List[float] = []
         valid_area_types: List[Optional[str]] = []
+        t_filter0 = time.perf_counter()
         for eb, name, conf, area_type in zip(crops_xyxy, cls_names, cls_confs, area_types):
             if eb is None:
                 continue
@@ -487,6 +644,11 @@ class VisionPipeline:
             valid_names.append(name)
             valid_confs.append(conf)
             valid_area_types.append(area_type)
+        timing["valid_filter_ms"] = (time.perf_counter() - t_filter0) * 1000.0
+        timing["valid_detection_count"] = len(valid_boxes)
 
         self._finish_debug_dump(debug_dump_dir, debug_meta)
+        timing["vision_total_ms"] = (time.perf_counter() - t_all0) * 1000.0
+        if return_timing:
+            return valid_boxes, valid_names, valid_confs, valid_area_types, (w, h), timing
         return valid_boxes, valid_names, valid_confs, valid_area_types, (w, h)

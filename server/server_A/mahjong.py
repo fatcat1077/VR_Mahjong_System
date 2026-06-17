@@ -1,4 +1,5 @@
 import re
+import time
 from collections import deque
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -238,6 +239,76 @@ def sort_tile_labels(labels: Sequence[str]) -> List[str]:
 def is_self_discard_turn_by_hand_count(hand_tiles: Sequence[int]) -> bool:
     """Player0 has just drawn when hand count is 3n+2."""
     return len(hand_tiles) > 0 and len(hand_tiles) % 3 == 2
+
+
+def synthesize_discard_hand(
+    detected_hand_tiles: Sequence[int],
+    target_count: int = 14,
+) -> Dict[str, Any]:
+    """Build a deterministic 3n+2 hand for latency-only PPO probing.
+
+    The synthetic hand keeps legal detected tiles first, caps each tile at four
+    copies, trims to target_count when needed, and fills missing tiles in fixed
+    tile-id order. This is intentionally deterministic so latency tests are
+    reproducible.
+    """
+    requested_target = int(target_count)
+    if requested_target <= 0 or requested_target % 3 != 2:
+        requested_target = 14
+    target = max(2, min(14, requested_target))
+
+    counts = np.zeros((34,), dtype=np.int8)
+    kept: List[int] = []
+    dropped: List[int] = []
+    invalid_count = 0
+
+    for raw_tile in detected_hand_tiles:
+        try:
+            tile_id = int(raw_tile)
+        except Exception:
+            invalid_count += 1
+            continue
+        if not (0 <= tile_id < 34):
+            invalid_count += 1
+            continue
+        if len(kept) >= target or counts[tile_id] >= 4:
+            dropped.append(tile_id)
+            continue
+        kept.append(tile_id)
+        counts[tile_id] += 1
+
+    filled: List[int] = []
+    fill_cursor = 0
+    while len(kept) < target:
+        tile_id = fill_cursor % 34
+        fill_cursor += 1
+        if counts[tile_id] >= 4:
+            continue
+        kept.append(tile_id)
+        filled.append(tile_id)
+        counts[tile_id] += 1
+
+    synthetic = bool(
+        filled
+        or dropped
+        or invalid_count > 0
+        or len([int(t) for t in detected_hand_tiles if isinstance(t, (int, np.integer)) or str(t).lstrip("-").isdigit()])
+        != len(kept)
+    )
+    kept_sorted = sort_tile_ids(kept)
+    return {
+        "synthetic": synthetic,
+        "target_count": target,
+        "original_count": len(detected_hand_tiles),
+        "synthetic_count": len(kept_sorted),
+        "tiles": kept_sorted,
+        "filled_tiles": sort_tile_ids(filled),
+        "dropped_tiles": sort_tile_ids(dropped),
+        "invalid_tile_count": invalid_count,
+        "labels": sorted_tile_labels_from_ids(kept_sorted),
+        "filled_labels": sorted_tile_labels_from_ids(filled),
+        "dropped_labels": sorted_tile_labels_from_ids(dropped),
+    }
 
 
 def count34_from_tiles(tiles: Sequence[int]) -> np.ndarray:
@@ -850,32 +921,162 @@ def maybe_correct_self_turn_and_suggest(
     table_observations: Optional[Sequence[Dict[str, Any]]] = None,
     rl_model=None,
     top_k: int = 5,
+    timing: Optional[Dict[str, Any]] = None,
+    fill_invalid_hand_for_ppo: bool = False,
+    ppo_fill_target_count: int = 14,
 ) -> Dict[str, Any]:
     """Debounce live vision, update turn state, and ask the PPO policy when it is our decision."""
+    t_func0 = time.perf_counter()
+
+    def finish(result: Dict[str, Any]) -> Dict[str, Any]:
+        if timing is not None:
+            timing.setdefault("ppo_live_update_ms", 0.0)
+            timing.setdefault("ppo_action_mask_ms", 0.0)
+            timing.setdefault("ppo_obs_build_ms", 0.0)
+            timing.setdefault("ppo_predict_ms", None)
+            timing.setdefault("ppo_topk_ms", None)
+            timing.setdefault("ppo_called", False)
+            timing["ppo_decision_type"] = result.get("decision_type", "none")
+            timing["ppo_source"] = result.get("source", "none")
+            timing["ppo_total_ms"] = (time.perf_counter() - t_func0) * 1000.0
+        return result
+
     hand_tiles = [int(t) for t in detected_hand_tiles if 0 <= int(t) < 34]
+
+    t_live0 = time.perf_counter()
     live_info = tracker.update_live_state(hand_tiles, table_observations)
+    if timing is not None:
+        timing["ppo_live_update_ms"] = (time.perf_counter() - t_live0) * 1000.0
+
+    t_mask0 = time.perf_counter()
     action_mask = legal_action_mask(tracker, hand_tiles)
+    if timing is not None:
+        timing["ppo_action_mask_ms"] = (time.perf_counter() - t_mask0) * 1000.0
+
+    def finish_synthetic_discard(skip_reason: str) -> Dict[str, Any]:
+        synthetic_info = synthesize_discard_hand(hand_tiles, target_count=ppo_fill_target_count)
+        synthetic_hand = [int(tile) for tile in synthetic_info["tiles"]]
+
+        old_phase = tracker.phase
+        old_current_player = tracker.current_player
+        try:
+            tracker.phase = PHASE_DISCARD
+            tracker.current_player = 0
+
+            t_synth_mask0 = time.perf_counter()
+            synthetic_action_mask = legal_action_mask(tracker, synthetic_hand)
+            if timing is not None:
+                timing["ppo_action_mask_ms"] = (time.perf_counter() - t_synth_mask0) * 1000.0
+
+            t_obs0 = time.perf_counter()
+            obs = build_obs_from_tracker(tracker, synthetic_hand)
+            if timing is not None:
+                timing["ppo_obs_build_ms"] = (time.perf_counter() - t_obs0) * 1000.0
+        finally:
+            tracker.phase = old_phase
+            tracker.current_player = old_current_player
+
+        source = "ppo_synthetic_fill"
+        reason = f"{skip_reason}; synthetic hand filled to {len(synthetic_hand)} tiles for PPO latency test"
+        action_id: Optional[int] = None
+
+        if rl_model is not None:
+            try:
+                t_predict0 = time.perf_counter()
+                action_id = _predict_policy_action(rl_model, obs, synthetic_action_mask)
+                if timing is not None:
+                    timing["ppo_predict_ms"] = (time.perf_counter() - t_predict0) * 1000.0
+                    timing["ppo_called"] = True
+            except Exception as e:
+                source = "fallback_synthetic_fill"
+                reason = f"{reason}; PPO predict failed, fallback discard ({e})"
+                action_id = fallback_discard_tile(synthetic_hand)
+        else:
+            source = "fallback_synthetic_fill"
+            reason = f"{reason}; PPO model not loaded, fallback discard"
+            action_id = fallback_discard_tile(synthetic_hand)
+
+        if action_id is None or not (0 <= int(action_id) < ACTION_DIM) or not bool(synthetic_action_mask[int(action_id)]):
+            source = "fallback_synthetic_fill" if source == "ppo_synthetic_fill" else source
+            reason = f"{reason}; PPO action illegal for synthetic hand, fallback discard"
+            action_id = fallback_discard_tile(synthetic_hand)
+
+        tile = tile_id_to_label(action_id) if action_id is not None and 0 <= int(action_id) < 34 else ""
+
+        t_topk0 = time.perf_counter()
+        topk = _topk_ppo_action_probs(rl_model, obs, top_k=top_k, action_mask=synthetic_action_mask)
+        if timing is not None:
+            timing["ppo_topk_ms"] = (time.perf_counter() - t_topk0) * 1000.0
+
+        live = dict(live_info)
+        live.update(
+            {
+                "synthetic_hand_for_ppo": True,
+                "synthetic_hand_reason": skip_reason,
+                "synthetic_hand_count": len(synthetic_hand),
+                "synthetic_filled_tiles": synthetic_info["filled_labels"],
+                "synthetic_dropped_tiles": synthetic_info["dropped_labels"],
+            }
+        )
+
+        return finish(
+            {
+                "corrected": bool(live_info.get("corrected", False)),
+                "current_player": 0,
+                "phase": PHASE_DISCARD,
+                "stable_count_frames": int(live_info.get("stable_count_frames", 0)),
+                "cooldown_frames_remaining": tracker.cooldown_frames_remaining,
+                "hand_count": len(synthetic_hand),
+                "detected_hand_count": len(hand_tiles),
+                "synthetic_hand_for_ppo": True,
+                "synthetic_hand": synthetic_info["labels"],
+                "synthetic_filled_tiles": synthetic_info["filled_labels"],
+                "synthetic_dropped_tiles": synthetic_info["dropped_labels"],
+                "synthetic_invalid_tile_count": int(synthetic_info["invalid_tile_count"]),
+                "last_discard": tracker.last_discard,
+                "last_discard_tile": tile_id_to_label(tracker.last_discard) if tracker.last_discard is not None else "",
+                "last_discarder": tracker.last_discarder,
+                "recommended_action": int(action_id) if action_id is not None else -1,
+                "recommended_tile": tile,
+                "decision_type": "discard",
+                "source": source,
+                "reason": reason,
+                "action_mask": [bool(x) for x in synthetic_action_mask.tolist()],
+                "topk": topk,
+                "live": live,
+            }
+        )
 
     if not live_info.get("hand_stable", False):
+        if fill_invalid_hand_for_ppo:
+            return finish_synthetic_discard("hand count is not stable yet")
         result = _empty_live_agent_result(hand_tiles, "hand count is not stable yet", tracker, live_info)
         result["stable_count_frames"] = int(live_info.get("stable_count_frames", 0))
-        return result
+        return finish(result)
 
     decision_type = "none"
     if tracker.phase == PHASE_DISCARD and tracker.current_player == 0:
         if not is_self_discard_turn_by_hand_count(hand_tiles):
+            if fill_invalid_hand_for_ppo:
+                return finish_synthetic_discard("stable hand count is not 3n+2")
             result = _empty_live_agent_result(hand_tiles, "stable hand count is not 3n+2", tracker, live_info)
             result["stable_count_frames"] = int(live_info.get("stable_count_frames", 0))
-            return result
+            return finish(result)
         decision_type = "discard"
     elif tracker.phase == PHASE_CLAIM and tracker.last_discarder != 0:
         decision_type = "claim"
     else:
+        if fill_invalid_hand_for_ppo:
+            return finish_synthetic_discard("waiting for another player's discard")
         result = _empty_live_agent_result(hand_tiles, "waiting for another player's discard", tracker, live_info)
         result["stable_count_frames"] = int(live_info.get("stable_count_frames", 0))
-        return result
+        return finish(result)
 
+    t_obs0 = time.perf_counter()
     obs = build_obs_from_tracker(tracker, hand_tiles)
+    if timing is not None:
+        timing["ppo_obs_build_ms"] = (time.perf_counter() - t_obs0) * 1000.0
+
     source = "ppo"
     reason = (
         "PPO policy (deterministic) for discard"
@@ -886,7 +1087,11 @@ def maybe_correct_self_turn_and_suggest(
 
     if rl_model is not None:
         try:
+            t_predict0 = time.perf_counter()
             action_id = _predict_policy_action(rl_model, obs, action_mask)
+            if timing is not None:
+                timing["ppo_predict_ms"] = (time.perf_counter() - t_predict0) * 1000.0
+                timing["ppo_called"] = True
         except Exception as e:
             source = "fallback"
             if decision_type == "discard":
@@ -918,7 +1123,12 @@ def maybe_correct_self_turn_and_suggest(
     else:
         tile = action_to_label(int(action_id)) if action_id is not None else ""
 
-    return {
+    t_topk0 = time.perf_counter()
+    topk = _topk_ppo_action_probs(rl_model, obs, top_k=top_k, action_mask=action_mask)
+    if timing is not None:
+        timing["ppo_topk_ms"] = (time.perf_counter() - t_topk0) * 1000.0
+
+    return finish({
         "corrected": bool(live_info.get("corrected", False)),
         "current_player": tracker.current_player,
         "phase": tracker.phase,
@@ -934,9 +1144,9 @@ def maybe_correct_self_turn_and_suggest(
         "source": source,
         "reason": reason,
         "action_mask": [bool(x) for x in action_mask.tolist()],
-        "topk": _topk_ppo_action_probs(rl_model, obs, top_k=top_k, action_mask=action_mask),
+        "topk": topk,
         "live": live_info,
-    }
+    })
 
 
 def load_ppo_model(ppo_model_path: Optional[str], ppo_device: Optional[str] = None):

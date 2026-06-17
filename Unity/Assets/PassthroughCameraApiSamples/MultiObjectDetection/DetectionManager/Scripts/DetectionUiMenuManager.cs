@@ -40,7 +40,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         [SerializeField] private int m_promptPane = DebugUIBuilder.DEBUG_PANE_LEFT;
         [SerializeField] private string m_promptTitle = "麻將小幫手";
         [SerializeField] private float m_promptWidth = 760f;
-        [SerializeField] private float m_promptHeight = 420f;
+        [SerializeField] private float m_promptHeight = 560f;
         [SerializeField] private float m_promptPadding = 24f;
         [SerializeField] private int m_promptFontSize = 30;
 
@@ -334,6 +334,11 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             }
             sb.AppendLine();
             AppendPromptSection(sb, "建議動作", action, "#FDE68A", 36);
+            if (!string.IsNullOrEmpty(_streamDebug))
+            {
+                sb.AppendLine();
+                AppendPromptSection(sb, "Latency", _streamDebug, "#A7F3D0", 20);
+            }
             return sb.ToString().TrimEnd();
         }
 

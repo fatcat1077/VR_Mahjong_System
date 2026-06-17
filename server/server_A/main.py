@@ -1,9 +1,13 @@
 import argparse
+import csv
 import json
 import socket
+import statistics
 import threading
 import time
 import signal
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -30,6 +34,309 @@ def _sigint_handler(sig, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
+def _percentile(values: List[float], p: float) -> float:
+    if not values:
+        return 0.0
+    xs = sorted(values)
+    if len(xs) == 1:
+        return float(xs[0])
+    rank = (len(xs) - 1) * (p / 100.0)
+    lo = int(rank)
+    hi = min(lo + 1, len(xs) - 1)
+    frac = rank - lo
+    return float(xs[lo] * (1.0 - frac) + xs[hi] * frac)
+
+
+def _make_run_dir(output_dir: Path) -> tuple[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base = datetime.now().strftime("%Y%m%d_%H%M%S_full_pipeline")
+    candidate = output_dir / base
+    suffix = 1
+    while candidate.exists():
+        candidate = output_dir / f"{base}_{suffix:02d}"
+        suffix += 1
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate.name, candidate
+
+
+class FullPipelineLatencyRecorder:
+    MS_FIELDS = [
+        "pc_frame_age_ms",
+        "decode_ms",
+        "segmentation_ms",
+        "det_postprocess_ms",
+        "crop_ms",
+        "classification_preprocess_ms",
+        "classification_forward_ms",
+        "classification_postprocess_ms",
+        "classification_total_ms",
+        "valid_filter_ms",
+        "vision_total_ms",
+        "hand_parse_ms",
+        "tracking_ms",
+        "tile_build_ms",
+        "agent_ms",
+        "ppo_live_update_ms",
+        "ppo_action_mask_ms",
+        "ppo_obs_build_ms",
+        "ppo_predict_ms",
+        "ppo_topk_ms",
+        "ppo_total_ms",
+        "json_serialize_ms",
+        "send_ms",
+        "total_pc_pipeline_ms",
+    ]
+
+    FIELDNAMES = [
+        "run_id",
+        "frame_index",
+        "recv_wall_time",
+        "image_w",
+        "image_h",
+        "jpg_bytes",
+        "recv_packets",
+        "pc_frame_age_ms",
+        "raw_detection_count",
+        "valid_detection_count",
+        "classified_crop_count",
+        "track_count",
+        "hand_count",
+        "live_hand_count",
+        "table_count",
+        "hand_id_count",
+        "classification_backend",
+        "batch_classification",
+        "ppo_called",
+        "ppo_synthetic_hand",
+        "ppo_detected_hand_count",
+        "ppo_synthetic_hand_count",
+        "ppo_filled_tile_count",
+        "ppo_filled_tiles",
+        "ppo_decision_type",
+        "ppo_source",
+        "ppo_action",
+        "ppo_tile",
+        *MS_FIELDS[1:],
+    ]
+
+    def __init__(self, output_dir: Path, metadata: Dict[str, Any]):
+        self.output_dir = output_dir
+        self.metadata = dict(metadata)
+        self._lock = threading.Lock()
+        self.run_id = ""
+        self.run_dir: Optional[Path] = None
+        self.per_frame_csv: Optional[Path] = None
+        self.summary_csv: Optional[Path] = None
+        self.metadata_json: Optional[Path] = None
+        self.measurement_started_at: Optional[str] = None
+        self.measurement_stopped_at: Optional[str] = None
+        self.measurement_status = "idle"
+        self.control_start: Dict[str, Any] = {}
+        self.control_stop: Dict[str, Any] = {}
+        self.frame_count = 0
+        self.ppo_called_frames = 0
+        self.ppo_synthetic_frames = 0
+        self._values: Dict[str, List[float]] = {key: [] for key in self.MS_FIELDS}
+        self._classified_crop_counts: List[int] = []
+        self._fh = None
+        self._writer: Optional[csv.DictWriter] = None
+
+    def is_recording(self) -> bool:
+        with self._lock:
+            return self.measurement_status == "recording" and self._writer is not None
+
+    def begin(self, control_msg: Dict[str, Any]) -> Path:
+        with self._lock:
+            self._close_open_file_locked()
+            self.run_id, self.run_dir = _make_run_dir(self.output_dir)
+            self.per_frame_csv = self.run_dir / "per_frame_latency.csv"
+            self.summary_csv = self.run_dir / "summary_latency.csv"
+            self.metadata_json = self.run_dir / "metadata.json"
+            self.measurement_started_at = datetime.now().isoformat(timespec="seconds")
+            self.measurement_stopped_at = None
+            self.measurement_status = "recording"
+            self.control_start = dict(control_msg)
+            self.control_stop = {}
+            self.frame_count = 0
+            self.ppo_called_frames = 0
+            self.ppo_synthetic_frames = 0
+            self._values = {key: [] for key in self.MS_FIELDS}
+            self._classified_crop_counts = []
+
+            self._fh = self.per_frame_csv.open("w", newline="", encoding="utf-8")
+            self._writer = csv.DictWriter(self._fh, fieldnames=self.FIELDNAMES)
+            self._writer.writeheader()
+            self._fh.flush()
+            self._write_metadata_locked()
+            return self.run_dir
+
+    def stop(self, control_msg: Dict[str, Any]) -> Optional[Path]:
+        with self._lock:
+            if self.measurement_status != "recording":
+                return self.run_dir
+            self.measurement_stopped_at = datetime.now().isoformat(timespec="seconds")
+            self.measurement_status = "stopped"
+            self.control_stop = dict(control_msg)
+            self._write_summary_locked()
+            self._write_metadata_locked()
+            self._close_open_file_locked()
+            return self.run_dir
+
+    def close(self) -> None:
+        with self._lock:
+            if self.measurement_status == "recording":
+                self.measurement_stopped_at = datetime.now().isoformat(timespec="seconds")
+                self.measurement_status = "closed"
+                self._write_summary_locked()
+                self._write_metadata_locked()
+            self._close_open_file_locked()
+
+    def record_frame(self, row: Dict[str, Any]) -> bool:
+        with self._lock:
+            if self.measurement_status != "recording" or self._writer is None or self._fh is None:
+                return False
+
+            self.frame_count += 1
+            out = {key: "" for key in self.FIELDNAMES}
+            out.update(row)
+            out["run_id"] = self.run_id
+            out["frame_index"] = self.frame_count
+            out["recv_wall_time"] = datetime.now().isoformat(timespec="milliseconds")
+
+            for key in self.MS_FIELDS:
+                value = out.get(key)
+                if value is None or value == "":
+                    out[key] = ""
+                    continue
+                try:
+                    numeric = float(value)
+                except Exception:
+                    out[key] = ""
+                    continue
+                out[key] = f"{numeric:.6f}"
+                self._values.setdefault(key, []).append(numeric)
+
+            try:
+                classified_count = int(out.get("classified_crop_count") or 0)
+                self._classified_crop_counts.append(classified_count)
+            except Exception:
+                pass
+            if bool(out.get("ppo_called", False)):
+                self.ppo_called_frames += 1
+            if bool(out.get("ppo_synthetic_hand", False)):
+                self.ppo_synthetic_frames += 1
+
+            self._writer.writerow(out)
+            self._fh.flush()
+            self._write_metadata_locked()
+            return True
+
+    def _summary_rows_locked(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for metric in self.MS_FIELDS:
+            vals = self._values.get(metric, [])
+            if vals:
+                avg_ms = statistics.fmean(vals)
+                rows.append(
+                    {
+                        "metric": metric,
+                        "frames": len(vals),
+                        "avg_ms": avg_ms,
+                        "median_ms": statistics.median(vals),
+                        "p90_ms": _percentile(vals, 90),
+                        "p95_ms": _percentile(vals, 95),
+                        "p99_ms": _percentile(vals, 99),
+                        "min_ms": min(vals),
+                        "max_ms": max(vals),
+                        "std_ms": statistics.pstdev(vals) if len(vals) > 1 else 0.0,
+                        "fps_from_avg": 1000.0 / avg_ms if avg_ms > 0 else 0.0,
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "metric": metric,
+                        "frames": 0,
+                        "avg_ms": 0.0,
+                        "median_ms": 0.0,
+                        "p90_ms": 0.0,
+                        "p95_ms": 0.0,
+                        "p99_ms": 0.0,
+                        "min_ms": 0.0,
+                        "max_ms": 0.0,
+                        "std_ms": 0.0,
+                        "fps_from_avg": 0.0,
+                    }
+                )
+        return rows
+
+    def _write_summary_locked(self) -> None:
+        if self.summary_csv is None:
+            return
+        fieldnames = [
+            "metric",
+            "frames",
+            "avg_ms",
+            "median_ms",
+            "p90_ms",
+            "p95_ms",
+            "p99_ms",
+            "min_ms",
+            "max_ms",
+            "std_ms",
+            "fps_from_avg",
+        ]
+        with self.summary_csv.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in self._summary_rows_locked():
+                formatted = dict(row)
+                for key in fieldnames:
+                    if key.endswith("_ms") or key == "fps_from_avg":
+                        formatted[key] = f"{float(formatted[key]):.6f}"
+                writer.writerow(formatted)
+
+    def _write_metadata_locked(self) -> None:
+        if self.metadata_json is None:
+            return
+        avg_classified = statistics.fmean(self._classified_crop_counts) if self._classified_crop_counts else 0.0
+        data = {
+            "run_id": self.run_id,
+            "measurement_status": self.measurement_status,
+            "measurement_started_at": self.measurement_started_at,
+            "measurement_stopped_at": self.measurement_stopped_at,
+            "frame_count": self.frame_count,
+            "ppo_called_frames": self.ppo_called_frames,
+            "ppo_skipped_frames": max(0, self.frame_count - self.ppo_called_frames),
+            "ppo_synthetic_frames": self.ppo_synthetic_frames,
+            "avg_classified_crops_per_frame": avg_classified,
+            "measurement_scope": (
+                "PC-side realtime pipeline after JPEG frame is available to the PC server: "
+                "JPEG decode, segmentation predict, crop/mask processing, batch classification, "
+                "tracking, Mahjong state/PPO, JSON serialization, and socket send. Quest capture, "
+                "JPEG encode, and network transfer before PC receive are excluded."
+            ),
+            "control_start": self.control_start,
+            "control_stop": self.control_stop,
+            "server_metadata": self.metadata,
+            "artifacts": {
+                "per_frame_csv": str(self.per_frame_csv) if self.per_frame_csv else "",
+                "summary_csv": str(self.summary_csv) if self.summary_csv else "",
+                "metadata_json": str(self.metadata_json) if self.metadata_json else "",
+            },
+        }
+        self.metadata_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _close_open_file_locked(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+        self._fh = None
+        self._writer = None
+
+
 class InferServer:
     def __init__(
         self,
@@ -52,9 +359,14 @@ class InferServer:
         cls_conf_threshold: float = 0.5,
         ppo_model_path: Optional[str] = None,
         ppo_device: Optional[str] = None,
+        ppo_fill_invalid_hand: bool = True,
+        ppo_fill_target_count: int = 14,
         client_idle_timeout: float = 5.0,
         debug_vision_dir: Optional[str] = None,
         debug_vision_interval: float = 1.0,
+        latency_output_dir: Optional[str] = None,
+        latency_exit_after_stop: bool = False,
+        latency_stale_timeout: float = 5.0,
     ):
         self.host = host
         self.port = port
@@ -62,6 +374,10 @@ class InferServer:
         self.view = view
         self.device = device
         self.client_idle_timeout = float(client_idle_timeout)
+        self.latency_exit_after_stop = bool(latency_exit_after_stop)
+        self.latency_stale_timeout = max(0.5, float(latency_stale_timeout))
+        self.ppo_fill_invalid_hand = bool(ppo_fill_invalid_hand)
+        self.ppo_fill_target_count = int(ppo_fill_target_count)
 
         # Models / pipeline
         self.vision = VisionPipeline(
@@ -86,6 +402,29 @@ class InferServer:
         # Mahjong PPO model (optional)
         self.ppo_model = mahjong.load_ppo_model(ppo_model_path, ppo_device=ppo_device)
         self.game_tracker = mahjong.GameStateTracker()
+        self.latency_recorder = FullPipelineLatencyRecorder(
+            output_dir=Path(latency_output_dir or "seg_latency_results"),
+            metadata={
+                "mode": "pc_stream_full_pipeline_latency",
+                "yolo_path": yolo_path,
+                "cls_path": cls_path,
+                "ppo_model_path": ppo_model_path or "",
+                "ppo_device": ppo_device or "",
+                "ppo_fill_invalid_hand_during_latency": self.ppo_fill_invalid_hand,
+                "ppo_fill_target_count": self.ppo_fill_target_count,
+                "device": device or "",
+                "det_imgsz": det_imgsz,
+                "det_conf": det_conf,
+                "det_iou": det_iou,
+                "cls_imgsz": cls_imgsz,
+                "cls_conf_threshold": cls_conf_threshold,
+                "crop_pad": crop_pad,
+                "track_iou": track_iou,
+                "track_ttl": track_ttl,
+                "smooth_len": smooth_len,
+                "latency_stale_timeout": self.latency_stale_timeout,
+            },
+        )
 
         # Shared (latest frame)
         self._latest_jpg: Optional[bytes] = None
@@ -117,13 +456,55 @@ class InferServer:
             return False
 
         command = str(msg.get("command") or "")
+        mode = str(msg.get("mode") or "")
         if command in ("scene_reset", "reset_scene", "reset"):
             with self._lock:
                 self._scene_reset_requested = True
             print("[Control] scene reset requested", flush=True)
             return True
+        if command in ("seg_latency_start", "pipeline_latency_start", "latency_start"):
+            if mode == "quest_local_sentis_forward_latency":
+                print(
+                    "[Latency] Ignoring Quest-local latency start on PC full-pipeline server. "
+                    "Launch Quest with seg_latency_mode=pc_stream.",
+                    flush=True,
+                )
+                return True
+            run_dir = self.latency_recorder.begin(msg)
+            print(f"[Latency] START full pipeline recording -> {run_dir}", flush=True)
+            return True
+        if command in ("seg_latency_stop", "pipeline_latency_stop", "latency_stop"):
+            if mode == "quest_local_sentis_forward_latency":
+                print(
+                    "[Latency] Ignoring Quest-local latency stop on PC full-pipeline server. "
+                    "No PC frames were recorded.",
+                    flush=True,
+                )
+                return True
+            run_dir = self.latency_recorder.stop(msg)
+            if run_dir is not None:
+                print(f"[Latency] STOP full pipeline recording -> {run_dir}", flush=True)
+                print(f"[Latency] summary -> {run_dir / 'summary_latency.csv'}", flush=True)
+            if self.latency_exit_after_stop:
+                STOP_EVENT.set()
+            return True
 
         return True
+
+    def _auto_stop_latency_recording(self, reason: str) -> None:
+        if not self.latency_recorder.is_recording():
+            return
+
+        stop_msg = {
+            "type": "control",
+            "command": "client_disconnect_auto_stop",
+            "mode": "pc_stream",
+            "reason": reason,
+        }
+        run_dir = self.latency_recorder.stop(stop_msg)
+        if run_dir is not None:
+            print(f"[Latency] AUTO STOP full pipeline recording ({reason}) -> {run_dir}", flush=True)
+            print(f"[Latency] summary -> {run_dir / 'summary_latency.csv'}", flush=True)
 
     def _set_latest_and_get_effective_hand(
         self,
@@ -396,18 +777,103 @@ class InferServer:
             lines.append("Stable: hand")
         return "\n".join(lines)
 
-    def _infer_once(self, frame_bgr) -> Dict[str, Any]:
+    @staticmethod
+    def _optional_ms(value: Any) -> Any:
+        if value is None:
+            return ""
+        return value
+
+    def _build_latency_row(
+        self,
+        out: Dict[str, Any],
+        jpg_bytes: int,
+        recv_packets: int,
+        decode_ms: float,
+        json_serialize_ms: float,
+        send_ms: float,
+        total_pc_pipeline_ms: float,
+        pc_frame_age_ms: float,
+    ) -> Dict[str, Any]:
+        debug = out.get("debug", {}) if isinstance(out.get("debug"), dict) else {}
+        agent = out.get("agent", {}) if isinstance(out.get("agent"), dict) else {}
+        synthetic_filled_tiles = agent.get("synthetic_filled_tiles", [])
+        if isinstance(synthetic_filled_tiles, (list, tuple)):
+            synthetic_filled_tiles_str = " ".join(str(tile) for tile in synthetic_filled_tiles)
+            synthetic_filled_tile_count = len(synthetic_filled_tiles)
+        else:
+            synthetic_filled_tiles_str = str(synthetic_filled_tiles or "")
+            synthetic_filled_tile_count = 0
+        return {
+            "image_w": out.get("img_w", 0),
+            "image_h": out.get("img_h", 0),
+            "jpg_bytes": jpg_bytes,
+            "recv_packets": recv_packets,
+            "pc_frame_age_ms": pc_frame_age_ms,
+            "raw_detection_count": debug.get("raw_detection_count", debug.get("det_count", 0)),
+            "valid_detection_count": debug.get("valid_detection_count", debug.get("det_count", 0)),
+            "classified_crop_count": debug.get("classified_crop_count", debug.get("det_count", 0)),
+            "track_count": debug.get("track_count", 0),
+            "hand_count": debug.get("hand_count", 0),
+            "live_hand_count": debug.get("live_hand_count", 0),
+            "table_count": debug.get("table_count", 0),
+            "hand_id_count": debug.get("hand_id_count", 0),
+            "classification_backend": debug.get("classification_backend", ""),
+            "batch_classification": debug.get("batch_classification", True),
+            "ppo_called": bool(debug.get("ppo_called", False)),
+            "ppo_synthetic_hand": bool(agent.get("synthetic_hand_for_ppo", False)),
+            "ppo_detected_hand_count": agent.get("detected_hand_count", debug.get("hand_id_count", 0)),
+            "ppo_synthetic_hand_count": agent.get("hand_count", ""),
+            "ppo_filled_tile_count": synthetic_filled_tile_count,
+            "ppo_filled_tiles": synthetic_filled_tiles_str,
+            "ppo_decision_type": debug.get("ppo_decision_type", agent.get("decision_type", "")),
+            "ppo_source": debug.get("ppo_source", agent.get("source", "")),
+            "ppo_action": agent.get("recommended_action", -1),
+            "ppo_tile": agent.get("recommended_tile", ""),
+            "decode_ms": decode_ms,
+            "segmentation_ms": debug.get("segmentation_ms", ""),
+            "det_postprocess_ms": debug.get("det_postprocess_ms", ""),
+            "crop_ms": debug.get("crop_ms", ""),
+            "classification_preprocess_ms": debug.get("classification_preprocess_ms", ""),
+            "classification_forward_ms": debug.get("classification_forward_ms", ""),
+            "classification_postprocess_ms": debug.get("classification_postprocess_ms", ""),
+            "classification_total_ms": debug.get("classification_total_ms", ""),
+            "valid_filter_ms": debug.get("valid_filter_ms", ""),
+            "vision_total_ms": debug.get("vision_total_ms", debug.get("vision_ms", "")),
+            "hand_parse_ms": debug.get("hand_parse_ms", ""),
+            "tracking_ms": debug.get("tracking_ms", ""),
+            "tile_build_ms": debug.get("tile_build_ms", ""),
+            "agent_ms": debug.get("agent_ms", ""),
+            "ppo_live_update_ms": debug.get("ppo_live_update_ms", ""),
+            "ppo_action_mask_ms": debug.get("ppo_action_mask_ms", ""),
+            "ppo_obs_build_ms": self._optional_ms(debug.get("ppo_obs_build_ms", "")),
+            "ppo_predict_ms": self._optional_ms(debug.get("ppo_predict_ms", "")),
+            "ppo_topk_ms": self._optional_ms(debug.get("ppo_topk_ms", "")),
+            "ppo_total_ms": debug.get("ppo_total_ms", ""),
+            "json_serialize_ms": json_serialize_ms,
+            "send_ms": send_ms,
+            "total_pc_pipeline_ms": total_pc_pipeline_ms,
+        }
+
+    def _infer_once(self, frame_bgr, collect_latency: bool = False) -> Dict[str, Any]:
         t0 = time.perf_counter()
         scene_reset = self._consume_scene_reset_request()
         h, w = frame_bgr.shape[:2]
         ts = time.time()
 
-        det_boxes, cls_names, cls_confs, area_types, (img_w, img_h) = self.vision.det_and_cls(
+        vision_result = self.vision.det_and_cls(
             frame_bgr,
             stop_event=STOP_EVENT,
+            return_timing=collect_latency,
+            sync_timing=collect_latency,
         )
+        if collect_latency:
+            det_boxes, cls_names, cls_confs, area_types, (img_w, img_h), vision_timing = vision_result
+        else:
+            det_boxes, cls_names, cls_confs, area_types, (img_w, img_h) = vision_result
+            vision_timing = {}
         t_vision = time.perf_counter()
 
+        t_hand0 = time.perf_counter()
         detected_hand_labels = [
             name for name, area_type in zip(cls_names, area_types) if area_type == "hand" and name
         ]
@@ -430,8 +896,12 @@ class InferServer:
             live_hand_labels,
             live_hand_tiles,
         )
+        t_hand1 = time.perf_counter()
         debug_info: Dict[str, Any] = {
             "det_count": len(det_boxes),
+            "raw_detection_count": int(vision_timing.get("raw_detection_count", len(det_boxes))) if vision_timing else len(det_boxes),
+            "valid_detection_count": len(det_boxes),
+            "classified_crop_count": int(vision_timing.get("classified_crop_count", len(det_boxes))) if vision_timing else len(det_boxes),
             "hand_count": len(effective_hand_labels),
             "live_hand_count": len(live_hand_labels),
             "hand_stable": hand_stable,
@@ -440,28 +910,38 @@ class InferServer:
             "table_count": len(detected_table_labels),
             "hand_id_count": len(detected_hand_tiles),
             "vision_ms": (t_vision - t0) * 1000.0,
+            "hand_parse_ms": (t_hand1 - t_hand0) * 1000.0,
+            "tracking_ms": 0.0,
+            "tile_build_ms": 0.0,
+            "track_count": 0,
             "agent_ms": 0.0,
             "total_ms": 0.0,
             "hand_events": hand_flow_events,
         }
+        debug_info.update(vision_timing)
 
         if not det_boxes:
             empty_advice = {
                 "benefit": {"tile_id": -1, "tile": "", "source": "", "reason": ""},
                 "safe": {"tile_id": -1, "tile": "", "source": "", "reason": ""},
             }
+            agent_timing: Dict[str, Any] = {}
             t_agent0 = time.perf_counter()
             agent_result = mahjong.maybe_correct_self_turn_and_suggest(
                 self.game_tracker,
                 detected_hand_tiles,
                 table_observations=[],
                 rl_model=self.ppo_model,
+                timing=agent_timing if collect_latency else None,
+                fill_invalid_hand_for_ppo=collect_latency and self.ppo_fill_invalid_hand,
+                ppo_fill_target_count=self.ppo_fill_target_count,
             )
             t_agent1 = time.perf_counter()
             stable_table = self.game_tracker.stable_table_labels()
             debug_info["agent_ms"] = (t_agent1 - t_agent0) * 1000.0
             debug_info["total_ms"] = (t_agent1 - t0) * 1000.0
             debug_info["stable_table_count"] = len(stable_table)
+            debug_info.update(agent_timing)
             return {
                 "ts": ts,
                 "img_w": w,
@@ -477,10 +957,15 @@ class InferServer:
                 "debug": debug_info,
             }
 
+        t_tracking0 = time.perf_counter()
         tracks = self.tracker.update(det_boxes, cls_names, cls_confs, area_types)
+        t_tracking1 = time.perf_counter()
+        debug_info["tracking_ms"] = (t_tracking1 - t_tracking0) * 1000.0
+        debug_info["track_count"] = len(tracks)
 
         tiles: List[Dict[str, Any]] = []
         table_observations: List[Dict[str, Any]] = []
+        t_tile0 = time.perf_counter()
         for tr in tracks:
             x1, y1, x2, y2 = tr.bbox
             cx = ((x1 + x2) / 2.0) / w
@@ -517,20 +1002,26 @@ class InferServer:
                     )
 
         tiles.sort(key=lambda t: t["cx"])
+        debug_info["tile_build_ms"] = (time.perf_counter() - t_tile0) * 1000.0
         hand = effective_hand_labels
         live_table = mahjong.sort_tile_labels(detected_table_labels)
+        agent_timing = {}
         t_agent0 = time.perf_counter()
         agent_result = mahjong.maybe_correct_self_turn_and_suggest(
             self.game_tracker,
             detected_hand_tiles,
             table_observations=table_observations,
             rl_model=self.ppo_model,
+            timing=agent_timing if collect_latency else None,
+            fill_invalid_hand_for_ppo=collect_latency and self.ppo_fill_invalid_hand,
+            ppo_fill_target_count=self.ppo_fill_target_count,
         )
         t_agent1 = time.perf_counter()
         stable_table = self.game_tracker.stable_table_labels()
         table = stable_table if stable_table else live_table
         debug_info["agent_ms"] = (t_agent1 - t_agent0) * 1000.0
         debug_info["total_ms"] = (t_agent1 - t0) * 1000.0
+        debug_info.update(agent_timing)
         debug_info["stable_table_count"] = agent_result.get("live", {}).get("stable_table_count", 0)
         debug_info["table_events"] = agent_result.get("live", {}).get("table_events", [])
         if agent_result.get("decision_type") == "discard":
@@ -675,11 +1166,21 @@ class InferServer:
                     last_status_print_time = 0.0
                     last_processed_frame_ts = -1.0
                     client_connected_time = time.time()
+                    client_end_reason = "client_connection_closed"
 
                     try:
                         while not STOP_EVENT.is_set():
                             now = time.time()
                             jpg, frame_ts, recv_packets, recv_bytes, receiver_error = self._get_latest()
+
+                            if receiver_error:
+                                client_end_reason = "receiver_error_before_frames" if jpg is None else "receiver_error"
+                                print(
+                                    f"[PC] {time.strftime('%H:%M:%S')} | closing client after receiver error: "
+                                    f"{receiver_error}",
+                                    flush=True,
+                                )
+                                break
 
                             if jpg is None:
                                 if now - last_status_print_time >= print_interval_sec:
@@ -696,16 +1197,24 @@ class InferServer:
                                         f"closing idle client: no frame for {self.client_idle_timeout:.1f}s",
                                         flush=True,
                                     )
+                                    client_end_reason = "idle_no_frames_timeout"
                                     break
                                 time.sleep(0.01)
                                 continue
 
                             if frame_ts == last_processed_frame_ts:
-                                if now - frame_ts >= self.client_idle_timeout:
+                                recording_wait = self.latency_recorder.is_recording()
+                                stale_timeout = (
+                                    self.latency_stale_timeout if recording_wait else self.client_idle_timeout
+                                )
+                                if now - frame_ts >= stale_timeout:
                                     print(
                                         f"[PC] {time.strftime('%H:%M:%S')} | "
-                                        f"closing stale client: no new frame for {self.client_idle_timeout:.1f}s",
+                                        f"closing stale client: no new frame for {stale_timeout:.1f}s",
                                         flush=True,
+                                    )
+                                    client_end_reason = (
+                                        "latency_stale_frame_timeout" if recording_wait else "stale_frame_timeout"
                                     )
                                     break
                                 time.sleep(0.005)
@@ -714,9 +1223,22 @@ class InferServer:
                             last_processed_frame_ts = frame_ts
 
                             try:
+                                recording_this_frame = self.latency_recorder.is_recording()
+                                t_pipeline0 = time.perf_counter()
+                                t_decode0 = time.perf_counter()
                                 frame = decode_jpg(jpg)
-                                out = self._infer_once(frame)
-                                out.setdefault("debug", {})["pc_frame_age_ms"] = (time.time() - frame_ts) * 1000.0
+                                decode_ms = (time.perf_counter() - t_decode0) * 1000.0
+                                out = self._infer_once(frame, collect_latency=recording_this_frame)
+                                pc_frame_age_ms = (time.time() - frame_ts) * 1000.0
+                                debug = out.setdefault("debug", {})
+                                debug["pc_frame_age_ms"] = pc_frame_age_ms
+                                debug["decode_ms"] = decode_ms
+                                debug["latency_recording"] = recording_this_frame
+                                debug["latency_run_id"] = self.latency_recorder.run_id if recording_this_frame else ""
+                                debug["latency_frame_index"] = (
+                                    self.latency_recorder.frame_count + 1 if recording_this_frame else 0
+                                )
+                                debug["pc_pipeline_before_send_ms"] = (time.perf_counter() - t_pipeline0) * 1000.0
                                 pc_log = self._format_pc_log(out)
                                 out["pc_log"] = pc_log
 
@@ -731,13 +1253,32 @@ class InferServer:
 
                                 # ---- send JSON back to Quest (length-prefixed, big-endian) ----
                                 try:
+                                    t_json0 = time.perf_counter()
                                     payload = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                                    json_serialize_ms = (time.perf_counter() - t_json0) * 1000.0
+                                    t_send0 = time.perf_counter()
                                     send_packet(conn, payload, send_lock, STOP_EVENT)
+                                    send_ms = (time.perf_counter() - t_send0) * 1000.0
+                                    total_pc_pipeline_ms = (time.perf_counter() - t_pipeline0) * 1000.0
+                                    if recording_this_frame:
+                                        row = self._build_latency_row(
+                                            out=out,
+                                            jpg_bytes=len(jpg),
+                                            recv_packets=recv_packets,
+                                            decode_ms=decode_ms,
+                                            json_serialize_ms=json_serialize_ms,
+                                            send_ms=send_ms,
+                                            total_pc_pipeline_ms=total_pc_pipeline_ms,
+                                            pc_frame_age_ms=pc_frame_age_ms,
+                                        )
+                                        self.latency_recorder.record_frame(row)
                                 except Exception as e:
                                     # if send fails, likely the Quest side closed the socket
                                     print(f"[PC] {time.strftime('%H:%M:%S')} | send failed: {e}", flush=True)
+                                    client_end_reason = "send_failed"
                                     raise
                             except InterruptedError:
+                                client_end_reason = "interrupted"
                                 raise
                             except Exception as e:
                                 print(f"[PC] {time.strftime('%H:%M:%S')} | infer failed: {e}", flush=True)
@@ -745,9 +1286,11 @@ class InferServer:
                     except InterruptedError:
                         pass
                     except (ConnectionError, OSError) as e:
+                        client_end_reason = "connection_error"
                         if not STOP_EVENT.is_set():
                             print(f"[PC] Client disconnected / error: {e}", flush=True)
                     finally:
+                        self._auto_stop_latency_recording(client_end_reason)
                         # Close client to unblock receiver
                         safe_close_conn(conn)
                         try:
@@ -758,6 +1301,7 @@ class InferServer:
 
         finally:
             safe_close_conn(server_conn)
+            self.latency_recorder.close()
             try:
                 cv2.destroyAllWindows()
             except Exception:
@@ -784,6 +1328,19 @@ def build_argparser() -> argparse.ArgumentParser:
 
     ap.add_argument("--ppo-model", default=None, help="path to SB3 PPO zip model (e.g., tw_mahjong_ppo_gpu.zip)")
     ap.add_argument("--ppo-device", default=None, help="SB3 device: cpu / cuda / cuda:0 (optional)")
+    ap.add_argument(
+        "--no-ppo-fill-invalid-hand",
+        action="store_false",
+        dest="ppo_fill_invalid_hand",
+        default=True,
+        help="disable latency-mode synthetic hand filling when the detected hand cannot enter PPO",
+    )
+    ap.add_argument(
+        "--ppo-fill-target-count",
+        type=int,
+        default=14,
+        help="synthetic hand size for latency-mode PPO probing; must be 3n+2, default 14",
+    )
 
     ap.add_argument("--print-interval", type=float, default=10.0, help="seconds between terminal advice prints")
     ap.add_argument(
@@ -802,6 +1359,22 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--debug-vision", action="store_true", help="save Quest frame and classification crops periodically")
     ap.add_argument("--debug-dir", default="debug_runtime", help="directory for --debug-vision dumps")
     ap.add_argument("--debug-interval", type=float, default=1.0, help="seconds between vision debug dumps")
+    ap.add_argument(
+        "--latency-output-dir",
+        default="seg_latency_results",
+        help="directory for A-button full-pipeline latency CSV/metadata outputs",
+    )
+    ap.add_argument(
+        "--latency-exit-after-stop",
+        action="store_true",
+        help="stop the PC server after receiving the A-button latency stop command",
+    )
+    ap.add_argument(
+        "--latency-stale-timeout",
+        type=float,
+        default=5.0,
+        help="seconds without new Quest frames while recording before auto-stopping the latency run",
+    )
     ap.add_argument(
         "--device",
         default=None,
@@ -834,9 +1407,14 @@ def main():
         cls_conf_threshold=args.cls_conf,
         ppo_model_path=args.ppo_model,
         ppo_device=args.ppo_device,
+        ppo_fill_invalid_hand=args.ppo_fill_invalid_hand,
+        ppo_fill_target_count=args.ppo_fill_target_count,
         client_idle_timeout=args.client_idle_timeout,
         debug_vision_dir=args.debug_dir if args.debug_vision else None,
         debug_vision_interval=args.debug_interval,
+        latency_output_dir=args.latency_output_dir,
+        latency_exit_after_stop=args.latency_exit_after_stop,
+        latency_stale_timeout=args.latency_stale_timeout,
     )
 
     srv.serve_forever(print_interval_sec=args.print_interval)

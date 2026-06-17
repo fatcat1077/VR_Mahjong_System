@@ -108,6 +108,12 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         private int _sceneResetRequests;
         private int _measurementToggleRequests;
         private bool _measurementActive;
+        private int _pcLatencyFrames;
+        private string _pcLatencySummary = "Latency: idle";
+        private int _autoPcLatencyDurationSec;
+        private bool _autoPcLatencyStarted;
+        private bool _autoPcLatencyStopped;
+        private float _autoPcLatencyStartTime;
 
         // Quest-local Sentis latency state.
         private readonly List<QuestSegLatencyModel> _questLatencyModels = new List<QuestSegLatencyModel>();
@@ -242,6 +248,39 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             public string output1_shape;
         }
 
+        [Serializable]
+        private class ServerDebug
+        {
+            public bool latency_recording;
+            public int latency_frame_index;
+            public float pc_pipeline_before_send_ms;
+            public float total_ms;
+            public float decode_ms;
+            public float pc_frame_age_ms;
+            public float segmentation_ms;
+            public float det_postprocess_ms;
+            public float crop_ms;
+            public float classification_preprocess_ms;
+            public float classification_forward_ms;
+            public float classification_total_ms;
+            public float vision_total_ms;
+            public float tracking_ms;
+            public float tile_build_ms;
+            public float agent_ms;
+            public float ppo_predict_ms;
+            public float ppo_topk_ms;
+            public float ppo_total_ms;
+            public bool ppo_called;
+            public int raw_detection_count;
+            public int valid_detection_count;
+            public int classified_crop_count;
+            public int hand_count;
+            public int table_count;
+            public string ppo_decision_type;
+            public string ppo_source;
+            public string latency_run_id;
+        }
+
         #region Unity Functions
         private IEnumerator Start()
         {
@@ -359,8 +398,9 @@ namespace PassthroughCameraSamples.MultiObjectDetection
         // =========================================================
         private void ApplySegLatencyModeOverrideFromAndroidIntent()
         {
-            // Default to Quest-local so old serialized scene values cannot accidentally select PC JPEG streaming.
-            m_questLocalSegLatencyMode = true;
+            // Default to PC streaming for the full-pipeline latency test.
+            // Quest-local segmentation-only benchmarks must opt in with seg_latency_mode=quest_local.
+            m_questLocalSegLatencyMode = false;
 
 #if UNITY_ANDROID && !UNITY_EDITOR
             try
@@ -369,6 +409,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 using var activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
                 using var intent = activity?.Call<AndroidJavaObject>("getIntent");
                 var mode = intent?.Call<string>("getStringExtra", "seg_latency_mode");
+                _autoPcLatencyDurationSec = intent?.Call<int>("getIntExtra", "latency_auto_duration_sec", 0) ?? 0;
 
                 if (string.Equals(mode, "pc_stream", StringComparison.OrdinalIgnoreCase))
                 {
@@ -382,7 +423,12 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 }
                 else
                 {
-                    Debug.Log("[SegLatencyMode] No Android intent override; using Quest local mode.");
+                    Debug.Log("[SegLatencyMode] No Android intent override; using PC stream mode.");
+                }
+
+                if (_autoPcLatencyDurationSec > 0)
+                {
+                    Debug.Log($"[SegLatencyMode] Auto PC latency duration: {_autoPcLatencyDurationSec}s.");
                 }
             }
             catch (Exception e)
@@ -697,7 +743,32 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             // receive & update UI (main thread)
             ProcessRecvQueue();
 
+            AutoPcLatencyUpdate();
+
             UpdateLocalStreamDebug();
+        }
+
+        private void AutoPcLatencyUpdate()
+        {
+            if (m_questLocalSegLatencyMode || _autoPcLatencyDurationSec <= 0)
+                return;
+
+            if (!_autoPcLatencyStarted && !_measurementActive && _connected && _framesSent > 0)
+            {
+                _autoPcLatencyStarted = true;
+                _autoPcLatencyStartTime = Time.unscaledTime;
+                SendSegLatencyMeasurementToggle();
+                Debug.Log($"[Stream] Auto PC latency START for {_autoPcLatencyDurationSec}s.");
+                return;
+            }
+
+            if (_autoPcLatencyStarted && !_autoPcLatencyStopped && _measurementActive &&
+                Time.unscaledTime - _autoPcLatencyStartTime >= _autoPcLatencyDurationSec)
+            {
+                _autoPcLatencyStopped = true;
+                SendSegLatencyMeasurementToggle();
+                Debug.Log("[Stream] Auto PC latency STOP.");
+            }
         }
 
         private void RefreshLatestStreamTexture()
@@ -861,6 +932,16 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             if (SendControlCommand(command, sequence))
             {
                 _measurementActive = nextActive;
+                if (_measurementActive)
+                {
+                    _pcLatencyFrames = 0;
+                    _pcLatencySummary = "Latency recording: START requested\nWaiting for the first PC latency frame...";
+                }
+                else
+                {
+                    _pcLatencySummary = "Latency recording: STOP requested\nPC is writing summary_latency.csv and per_frame_latency.csv.";
+                }
+                UpdateLocalStreamDebug(force: true);
                 var state = _measurementActive ? "START" : "STOP";
                 Debug.Log($"[Stream] Seg latency measurement {state} requested by A button.");
             }
@@ -1021,6 +1102,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             public bool hand_stable;
             public SentisInferenceUiManager.Advice advice;
             public string pc_log;
+            public ServerDebug debug;
         }
 
         private static bool ReadExact(NetworkStream stream, byte[] buf, int offset, int count)
@@ -1101,6 +1183,7 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 var resp = JsonUtility.FromJson<ServerResponse>(latest);
                 if (resp == null) return;
                 Interlocked.Increment(ref _responsesReceived);
+                UpdatePcLatencySummary(resp.debug);
 
                 // Update prompt panel (preferred)
                 if (m_menuUi != null)
@@ -1127,10 +1210,36 @@ namespace PassthroughCameraSamples.MultiObjectDetection
             }
         }
 
-        private void UpdateLocalStreamDebug()
+        private void UpdatePcLatencySummary(ServerDebug debug)
+        {
+            if (debug == null)
+                return;
+
+            if (debug.latency_recording)
+            {
+                _pcLatencyFrames = Mathf.Max(_pcLatencyFrames, Mathf.Max(0, debug.latency_frame_index));
+            }
+
+            var status = _measurementActive ? "RECORDING" : "IDLE";
+            if (debug.latency_recording)
+                status = "RECORDING";
+
+            var currentMs = debug.pc_pipeline_before_send_ms > 0f ? debug.pc_pipeline_before_send_ms : debug.total_ms;
+            var ppoText = debug.ppo_called ? $"{debug.ppo_predict_ms:0.0} ms" : "not called";
+            var runText = !string.IsNullOrEmpty(debug.latency_run_id) ? $" run={debug.latency_run_id}" : "";
+
+            _pcLatencySummary =
+                $"Latency {status}{runText}\n" +
+                $"frames={_pcLatencyFrames} det={debug.valid_detection_count}/{debug.raw_detection_count} crops={debug.classified_crop_count} hand={debug.hand_count} table={debug.table_count}\n" +
+                $"current={currentMs:0.0} ms | decode={debug.decode_ms:0.0} ms | age={debug.pc_frame_age_ms:0.0} ms\n" +
+                $"seg={debug.segmentation_ms:0.0} ms | clsFwd={debug.classification_forward_ms:0.0} ms | clsTotal={debug.classification_total_ms:0.0} ms\n" +
+                $"vision={debug.vision_total_ms:0.0} ms | agent={debug.agent_ms:0.0} ms | PPO={ppoText}";
+        }
+
+        private void UpdateLocalStreamDebug(bool force = false)
         {
             if (!m_showStreamDebug || m_menuUi == null) return;
-            if (Time.unscaledTime < _nextDebugUiTime) return;
+            if (!force && Time.unscaledTime < _nextDebugUiTime) return;
             _nextDebugUiTime = Time.unscaledTime + Mathf.Max(0.1f, m_debugUiIntervalSec);
 
             if (m_questLocalSegLatencyMode)
@@ -1155,7 +1264,8 @@ namespace PassthroughCameraSamples.MultiObjectDetection
                 $"queued={_framesQueued} sent={_framesSent} recv={_responsesReceived} " +
                 $"sceneReset={_sceneResetRequests} segLatency={(_measurementActive ? "recording" : "idle")} toggles={_measurementToggleRequests} " +
                 $"pending={pending} capture={capture} lastKB={_lastSentBytes / 1024f:0.0} " +
-                $"connects={_connectAttempts} sendErr={_sendFailures} recvErr={_recvFailures} jsonErr={_jsonParseErrors}";
+                $"connects={_connectAttempts} sendErr={_sendFailures} recvErr={_recvFailures} jsonErr={_jsonParseErrors}\n" +
+                _pcLatencySummary;
             m_menuUi.SetStreamDebug(debug);
         }
 

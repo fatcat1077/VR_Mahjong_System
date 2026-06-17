@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<title>Latency Analysis Report</title>
+<style>
+body { font-family: "Microsoft JhengHei", Arial, sans-serif; margin: 28px; color: #111827; }
+h1 { font-size: 26px; margin-bottom: 8px; }
+h2 { font-size: 20px; margin-top: 32px; border-bottom: 2px solid #E5E7EB; padding-bottom: 6px; }
+.note { color: #374151; line-height: 1.6; }
+.data-table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 12px 0 18px; }
+.data-table th { background: #1F2937; color: white; padding: 7px; border: 1px solid #D1D5DB; }
+.data-table td { padding: 6px; border: 1px solid #D1D5DB; text-align: right; }
+.data-table td:first-child, .data-table th:first-child { text-align: left; }
+img { max-width: 100%; border: 1px solid #E5E7EB; margin: 10px 0 20px; }
+code { background: #F3F4F6; padding: 2px 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>VR Mahjong Latency Analysis</h1>
+<div class="note">
+<ul>
+  <li>?????C:\Users\user\Desktop\VR_Mahjong_System\server\seg_latency_results</li>
+  <li>? frames?346</li>
+  <li>?????<code>classified_crop_count</code>???????? crop/classification ????????</li>
+  <li>???????????? n >= 3 ????????????? CSV?</li>
+  <li>???????? 600 ms ? run?<code>20260617_161017_full_pipeline</code>??? total pipeline = 596.1 ms?</li>
+</ul>
+</div>
+<h2>? 1??????? vs ????</h2>
+<img src="figure_1_tile_count_latency_trend.png" alt="Tile count latency trend" />
+<h2>?? 1????????????</h2>
+<table class="dataframe data-table">
+  <thead>
+    <tr style="text-align: right;">
+      <th>tiles</th>
+      <th>frames</th>
+      <th>avg_table</th>
+      <th>total_ms</th>
+      <th>seg_ms</th>
+      <th>post_ms</th>
+      <th>crop_ms</th>
+      <th>cls_ms</th>
+      <th>ppo_ms</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>0</td>
+      <td>81</td>
+      <td>0.000</td>
+      <td>121.422</td>
+      <td>87.437</td>
+      <td>0.072</td>
+      <td>0.000</td>
+      <td>0.000</td>
+      <td>3.656</td>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td>4</td>
+      <td>0.500</td>
+      <td>164.719</td>
+      <td>88.525</td>
+      <td>4.986</td>
+      <td>4.003</td>
+      <td>27.142</td>
+      <td>2.986</td>
+    </tr>
+    <tr>
+      <td>12</td>
+      <td>167</td>
+      <td>7.970</td>
+      <td>65.252</td>
+      <td>26.871</td>
+      <td>12.673</td>
+      <td>7.325</td>
+      <td>11.634</td>
+      <td>0.696</td>
+    </tr>
+    <tr>
+      <td>13</td>
+      <td>12</td>
+      <td>8.167</td>
+      <td>74.794</td>
+      <td>31.749</td>
+      <td>14.725</td>
+      <td>7.984</td>
+      <td>13.172</td>
+      <td>0.726</td>
+    </tr>
+    <tr>
+      <td>20</td>
+      <td>9</td>
+      <td>11.333</td>
+      <td>447.658</td>
+      <td>131.430</td>
+      <td>106.159</td>
+      <td>73.473</td>
+      <td>87.454</td>
+      <td>3.618</td>
+    </tr>
+    <tr>
+      <td>21</td>
+      <td>13</td>
+      <td>11.923</td>
+      <td>482.131</td>
+      <td>123.946</td>
+      <td>118.932</td>
+      <td>84.535</td>
+      <td>105.935</td>
+      <td>4.435</td>
+    </tr>
+    <tr>
+      <td>28</td>
+      <td>14</td>
+      <td>11.857</td>
+      <td>478.595</td>
+      <td>100.370</td>
+      <td>129.173</td>
+      <td>101.310</td>
+      <td>101.689</td>
+      <td>3.574</td>
+    </tr>
+    <tr>
+      <td>29</td>
+      <td>8</td>
+      <td>11.750</td>
+      <td>598.143</td>
+      <td>120.940</td>
+      <td>189.571</td>
+      <td>126.067</td>
+      <td>111.580</td>
+      <td>3.351</td>
+    </tr>
+    <tr>
+      <td>36</td>
+      <td>13</td>
+      <td>19.231</td>
+      <td>581.372</td>
+      <td>113.089</td>
+      <td>167.872</td>
+      <td>135.191</td>
+      <td>113.138</td>
+      <td>3.655</td>
+    </tr>
+    <tr>
+      <td>37</td>
+      <td>6</td>
+      <td>19.167</td>
+      <td>593.320</td>
+      <td>118.739</td>
+      <td>172.090</td>
+      <td>134.717</td>
+      <td>114.111</td>
+      <td>3.422</td>
+    </tr>
+    <tr>
+      <td>38</td>
+      <td>3</td>
+      <td>21.000</td>
+      <td>597.319</td>
+      <td>113.779</td>
+      <td>166.496</td>
+      <td>136.904</td>
+      <td>127.672</td>
+      <td>3.193</td>
+    </tr>
+    <tr>
+      <td>44</td>
+      <td>6</td>
+      <td>26.500</td>
+      <td>804.519</td>
+      <td>130.924</td>
+      <td>210.453</td>
+      <td>160.017</td>
+      <td>244.239</td>
+      <td>3.315</td>
+    </tr>
+  </tbody>
+</table>
+<h2>? 2?? 600 ms ????????</h2>
+<img src="figure_2_pipeline_distribution_pie.png" alt="Pipeline latency pie" />
+<h2>?? 2?? 600 ms ????????</h2>
+<table class="dataframe data-table">
+  <thead>
+    <tr style="text-align: right;">
+      <th>component</th>
+      <th>avg_ms</th>
+      <th>share_percent</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>JPEG decode</td>
+      <td>30.081</td>
+      <td>5.05</td>
+    </tr>
+    <tr>
+      <td>Segmentation predict</td>
+      <td>115.067</td>
+      <td>19.30</td>
+    </tr>
+    <tr>
+      <td>Detection postprocess</td>
+      <td>169.746</td>
+      <td>28.47</td>
+    </tr>
+    <tr>
+      <td>Crop / mask generation</td>
+      <td>136.558</td>
+      <td>22.91</td>
+    </tr>
+    <tr>
+      <td>Batch classification</td>
+      <td>122.083</td>
+      <td>20.48</td>
+    </tr>
+    <tr>
+      <td>Mahjong agent / PPO block</td>
+      <td>6.928</td>
+      <td>1.16</td>
+    </tr>
+    <tr>
+      <td>Tracking + tile build + hand parse</td>
+      <td>9.069</td>
+      <td>1.52</td>
+    </tr>
+    <tr>
+      <td>JSON serialize + socket send</td>
+      <td>1.148</td>
+      <td>0.19</td>
+    </tr>
+    <tr>
+      <td>Other overhead</td>
+      <td>5.452</td>
+      <td>0.91</td>
+    </tr>
+  </tbody>
+</table>
+</body>
+</html>
